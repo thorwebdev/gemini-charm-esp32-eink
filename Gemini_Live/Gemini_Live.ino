@@ -498,7 +498,15 @@ void serverMessage(const uint8_t *data,size_t len) {
     stopSession("API error. Check key / model");return;
   }
   if(doc["setupComplete"].is<JsonObject>()) {
-    live=true;sessionStarted=millis();status("Listening");return;
+    live=true;sessionStarted=millis();status("Listening");
+    if(audioReady)xQueueReset(micQueue);
+    JsonDocument greeting;
+    greeting["clientContent"]["turns"][0]["role"]="user";
+    greeting["clientContent"]["turns"][0]["parts"][0]["text"]="Say: \"Hey, I'm Gemini, how can I help you?\"";
+    greeting["clientContent"]["turnComplete"]=true;
+    sendJson(greeting);
+    Serial.println("GREETING_SENT: 'Hey, I'm Gemini, how can I help you?'");
+    return;
   }
   handleHermesCalls(doc);
   auto content=doc["serverContent"];
