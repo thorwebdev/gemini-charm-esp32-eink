@@ -39,15 +39,16 @@ The included TLS trust root is ISRG Root X1. Your backend certificate must chain
 
 ## 5. Start a conversation
 
-- Short BOOT press (or front screen press on AtomS3R): start/stop Gemini Live; press to wake from idle light sleep.
-- Speak after the display shows Listening. Ask an ordinary question first.
-- With Hermes configured, ask for an action supported by your backend. Routing is model-driven.
-- Bell: a Hermes completion/approval event arrived; result remains queued for a Live session.
-- Volume control:
+- **Waveshare**: Short BOOT press to start/stop Gemini Live; press to wake from idle light sleep.
+- **AtomS3R**: Click the front screen button (GPIO 41) to start/stop; double-click to cycle volume (50%, 70%, 85%, 100%).
+- **AtomS3R CAM**: Automatically starts the Gemini Live session once connected to Wi-Fi (or trigger via `click` / `start_session` in the serial monitor). Captures live video from the GC0308 camera and streams JPEG frames to Gemini Live at 1 FPS for real-time visual reasoning.
+- **Greeting**: Gemini automatically initiates the conversation upon connecting by speaking: *"Hey, I'm Gemini, how can I help you?"*.
+- **Volume control**:
   - Waveshare: short press volume button to increase; long press to decrease.
-  - AtomS3R: double-click the front screen button to cycle through volume levels (30%, 50%, 75%, 90%, 100%).
+  - AtomS3R: double-click the front screen button to cycle volume levels.
+  - AtomS3R CAM: use serial command `vol <0-100>` or `+` / `-` in `tools/monitor.py`.
 
-The firmware sleeps after idle inactivity when no session or background task is active (woken by BOOT / screen press). Serial diagnostics include spoken response text and task information; keep logs private.
+The firmware sleeps after idle inactivity when no session or background task is active. Serial diagnostics include spoken response text and task information; keep logs private.
 
 ## 6. Optional: save backup Wi-Fi
 

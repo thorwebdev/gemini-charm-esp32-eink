@@ -5,12 +5,14 @@
 Supported boards:
 
 - **Waveshare ESP32-S3 e-Paper Board (Default)**: 8 MB flash, 8 MB OPI PSRAM, ES8311 speaker codec, ES7210 microphone codec and 200×200 e-paper panel. Display pins: CS 11, DC 10, RESET 9, BUSY 8, MOSI 13, clock 12, power control 6. BOOT button: GPIO 0. Volume button: GPIO 18.
-- **M5Stack AtomS3R AI Chatbot Kit**: ESP32-S3-PICO-1-N8R8 (8 MB PSRAM) + Atomic Voice Base (ES8311 codec + NS4150B amplifier via PI4IOE expander on I2C `0x43`, 128×128 color IPS LCD GC9107). Button: GPIO 41 (front screen). Enabled via `#define BOARD_M5STACK_ATOMS3R` in `Gemini_Live/Gemini_Live.ino`.
+- **M5Stack AtomS3R AI Chatbot Kit**: ESP32-S3-PICO-1-N8R8 (8 MB PSRAM) + Atomic Voice Base (ES8311 codec + NS4150B amplifier via PI4IOE expander on I2C `0x43`, 128×128 color IPS LCD GC9107). Button: GPIO 41 (front screen). Enabled via `#define BOARD_M5STACK_ATOMS3R`.
+- **M5Stack AtomS3R CAM AI Chatbot Kit**: ESP32-S3-PICO-1-N8R8 (8 MB PSRAM) + Atomic Voice Base + GC0308 0.3MP Camera. Streams live video frames at 1 FPS to Gemini Live for multimodal visual understanding. Auto-detected at runtime or forced via `#define BOARD_M5STACK_ATOMS3R_CAM`.
 
 ### Purchase options
 
 - [Waveshare on Amazon](https://www.amazon.com/dp/B0GV417JB7)
 - [M5Stack AtomS3R AI Chatbot Kit](https://shop.m5stack.com/products/atoms3r-ai-chatbot-kit-8mb-psram)
+- [M5Stack AtomS3R CAM AI Chatbot Kit](https://shop.m5stack.com/products/atoms3r-cam-ai-chatbot-kit-8mb-psram)
 
 ## 2. Install tools
 

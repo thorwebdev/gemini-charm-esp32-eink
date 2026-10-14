@@ -50,7 +50,7 @@ Tail live runtime logs and debug output from the device at any time with:
 arduino-cli monitor -p PORT -c baudrate=115200
 ```
 
-This device firmware supports both the original Waveshare ESP32-S3 e-Paper board and the M5Stack AtomS3R AI Chatbot Kit. Hermes is an optional backend placeholder. You can replace it with any agent through a compatible API or adapter; see [agent backend interface](docs/AGENT_BACKEND.md). The backend is a separate service and is not included. Included vendor sources retain their original licenses. No new license is granted for the application code.
+This device firmware supports the original Waveshare ESP32-S3 e-Paper board, the M5Stack AtomS3R AI Chatbot Kit (display edition), and the M5Stack AtomS3R CAM AI Chatbot Kit (multimodal camera edition with 1 FPS live video streaming). Hermes is an optional backend placeholder. You can replace it with any agent through a compatible API or adapter; see [agent backend interface](docs/AGENT_BACKEND.md). The backend is a separate service and is not included. Included vendor sources retain their original licenses. No new license is granted for the application code.
 
 The saved v3.2 checkpoint reports successful compilation, flash verification, direct-answer and Hermes-delegation tests. Microphone recognition was not verified in that checkpoint. This export makes the original personal Hermes URL configurable; the rest of the saved firmware is preserved. No hardware is flashed during export.
 
