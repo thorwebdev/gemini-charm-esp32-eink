@@ -379,17 +379,39 @@ void clearAudio() {
   readPos=writePos=audioUsed=0;
   xSemaphoreGive(audioMutex);
 }
-void changeVolume(int delta) {
+void applyVolumeConfig(esp_codec_dev_handle_t spk) {
+#ifdef BOARD_M5STACK_ATOMS3R
+  static const esp_codec_dev_vol_map_t atomVolMap[] = {
+    {0, -96.0f},
+    {15, -30.0f},
+    {35, -16.0f},
+    {55, -6.0f},
+    {75, +3.0f},
+    {90, +9.0f},
+    {100, +14.0f}
+  };
+  esp_codec_dev_vol_curve_t atomVolCurve = {
+    .vol_map = (esp_codec_dev_vol_map_t *)atomVolMap,
+    .count = sizeof(atomVolMap) / sizeof(atomVolMap[0])
+  };
+  esp_codec_dev_set_vol_curve(spk, &atomVolCurve);
+#endif
+}
+
+void setVolume(int next) {
   lastActivity=millis();
   if(!audioReady)return;
-  buttonTone(delta>0?1100:660);
-  int next=constrain((int)volume+delta,0,100);
-  if(next==volume)return;
+  next=constrain(next,0,100);
   if(esp_codec_dev_set_out_vol(speaker,next)!=0){Serial.println("ERROR: volume change");return;}
   volume=next;prefs.putUChar("volume",next);
   Serial.printf("VOLUME: %d%%\n",next);
   char text[96]={};lastScreen.toCharArray(text,sizeof(text));
   xQueueOverwrite(screenQueue,text);
+}
+
+void changeVolume(int delta) {
+  buttonTone(delta>0?1100:660);
+  setVolume((int)volume+delta);
 }
 void handleVolumeButton() {
   bool pressed=digitalRead(18);
@@ -573,6 +595,11 @@ void readSetup() {
         continue;
       }
       if(doc["command"]=="stop_session") {stopSession("Ready. Click BOOT");continue;}
+      if(doc["command"]=="volume" || doc["command"]=="set_volume") {
+        int v = doc["value"] | doc["level"] | 85;
+        setVolume(v);
+        continue;
+      }
       if(doc["command"]=="test_prompt") {
         lastActivity=millis();String prompt=doc["text"] | "";
         if(!live||generating||playing||prompt.isEmpty()){Serial.println("TEST_PROMPT_REJECTED: session must be listening");continue;}
@@ -641,7 +668,13 @@ void setup() {
   Serial.begin(115200);delay(1500);pinMode(0,INPUT_PULLUP);pinMode(18,INPUT_PULLUP);
 #endif
   WiFi.onEvent([](WiFiEvent_t,WiFiEventInfo_t info){wifiFailureReason=info.wifi_sta_disconnected.reason;},ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+#ifdef BOARD_M5STACK_ATOMS3R
+  prefs.begin("gemini",false);
+  volume=constrain((int)prefs.getUChar("volume",85),0,100);
+  if(volume<75){volume=85;prefs.putUChar("volume",85);}
+#else
   prefs.begin("gemini",false);volume=constrain((int)prefs.getUChar("volume",55),0,100);
+#endif
   sleepScreenReady=xSemaphoreCreateBinary();
   screenQueue=xQueueCreate(1,96);toneQueue=xQueueCreate(4,sizeof(int));audioMutex=xSemaphoreCreateMutex();
   audioRing=(uint8_t*)ps_malloc(AUDIO_CAP);
@@ -674,7 +707,9 @@ void setup() {
     micQueue=xQueueCreate(4,sizeof(MicFrame));
     Serial.printf("AUDIO INIT: speaker=%d mic=%d AEC=%d queue=%d free RAM=%u\n",speakerResult,micResult,echoCanceller!=nullptr,micQueue!=nullptr,ESP.getFreeHeap());
     audioReady=echoCanceller&&micQueue&&toneQueue&&audioRing&&speakerResult==0&&micResult==0;
-    if(audioReady){esp_codec_dev_set_out_vol(speaker,volume);esp_codec_dev_set_in_gain(mic,MIC_GAIN_DB);
+    if(audioReady){
+      applyVolumeConfig(speaker);
+      esp_codec_dev_set_out_vol(speaker,volume);esp_codec_dev_set_in_gain(mic,MIC_GAIN_DB);
       xTaskCreatePinnedToCore(audioTask,"audio_aec",16384,nullptr,4,nullptr,1);
       Serial.println("AEC READY: 16kHz software echo cancellation");}
   }
@@ -751,7 +786,10 @@ void enterIdleSleep() {
     aec_destroy(echoCanceller);echoCanceller=aec_pro_create(aecFrameSamples/16,1,aecMode);
     audioReady=out==0&&in==0&&echoCanceller!=nullptr;
     Serial.printf("AEC WAKE RESET: ready=%d frame=%d mode=%d\n",echoCanceller!=nullptr,aecFrameSamples/16,aecMode);
-    if(audioReady){esp_codec_dev_set_out_vol(speaker,volume);esp_codec_dev_set_in_gain(mic,MIC_GAIN_DB);}
+    if(audioReady){
+      applyVolumeConfig(speaker);
+      esp_codec_dev_set_out_vol(speaker,volume);esp_codec_dev_set_in_gain(mic,MIC_GAIN_DB);
+    }
     else Serial.println("ERROR: audio resume failed");
   }
   Serial.printf("LIGHT_SLEEP_EXIT: result=%d wake=%d\n",result,esp_sleep_get_wakeup_cause());
@@ -835,10 +873,10 @@ void loop() {
   }
   if (M5.BtnA.wasDoubleClicked()) {
     lastActivity = millis();
-    int newVol = volume + 15;
-    if (newVol > 100) newVol = 40;
+    int newVol = volume + 20;
+    if (newVol > 100) newVol = 50;
     Serial.printf("BUTTON EVENT: Double click (volume %d%%)\n", newVol);
-    changeVolume(newVol - volume);
+    setVolume(newVol);
   }
 #endif
 

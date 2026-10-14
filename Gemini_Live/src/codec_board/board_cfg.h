@@ -19,7 +19,7 @@ const char board_cfg_data[] = {
   "Board: AtomS3R_Voice\n"
   "i2c: {sda: 38, scl: 39}\n"
   "i2s: {bclk: 8, ws: 6, dout: 5, din: 7, mclk: -1}\n"
-  "in_out: {codec: ES8311, pa: -1, use_mclk: 0, pa_gain:6}\n"
+  "in_out: {codec: ES8311, pa: -1, use_mclk: 0, pa_gain:0}\n"
 };
 const char *board_cfg_start = board_cfg_data;
 const char *board_cfg_end = board_cfg_data + sizeof(board_cfg_data) - 1;  // -1去掉末尾\0

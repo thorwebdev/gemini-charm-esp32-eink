@@ -12,7 +12,7 @@ def main():
     args = parser.parse_args()
 
     print(f"Connecting to {args.port} at {args.baud} baud...")
-    print("Press Ctrl+C to exit. Type 'click' or 'c' + Enter to simulate screen button click.\n" + "-" * 60)
+    print("Commands: 'c' (click button), 'vol 90' (set volume %), '+' (max vol), '-' (mid vol), 'diag' (wifi diagnostics).\n" + "-" * 70)
 
     try:
         ser = serial.Serial(args.port, args.baud, timeout=0.5)
@@ -46,6 +46,18 @@ def main():
             elif cmd in ('diag', 'd'):
                 ser.write(b'{"command":"wifi_diagnostics"}\n')
                 print("[Sent diagnostics request]")
+            elif cmd.startswith('vol ') or cmd.startswith('v '):
+                parts = cmd.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    v = int(parts[1])
+                    ser.write(f'{{"command":"volume","value":{v}}}\n'.encode('utf-8'))
+                    print(f"[Sent volume {v}%]")
+            elif cmd == '+':
+                ser.write(b'{"command":"volume","value":100}\n')
+                print("[Sent volume 100%]")
+            elif cmd == '-':
+                ser.write(b'{"command":"volume","value":50}\n')
+                print("[Sent volume 50%]")
             elif cmd:
                 ser.write((cmd + '\n').encode('utf-8'))
     except KeyboardInterrupt:
