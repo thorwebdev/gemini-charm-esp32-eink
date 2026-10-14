@@ -17,8 +17,25 @@
 #include "resample_filter.h"
 #include "src/codec_board/codec_board.h"
 #include "src/codec_board/codec_init.h"
+#define BOARD_M5STACK_ATOMS3R
+
+#ifdef BOARD_M5STACK_ATOMS3R
+#include <M5Unified.h>
+#else
 #include "epaper_driver_bsp.h"
+#endif
 #include "google_roots.h"
+
+#ifdef BOARD_M5STACK_ATOMS3R
+void enableAtomVoiceAmp() {
+  m5gfx::i2c::i2c_temporary_switcher_t switcher(1, GPIO_NUM_38, GPIO_NUM_39);
+  m5gfx::i2c::writeRegister8(1, 0x43, 0x03, 0xFF, 0, 400000); // IO direction: output
+  m5gfx::i2c::writeRegister8(1, 0x43, 0x05, 0xFF, 0, 400000); // output HIGH (enable PA)
+  m5gfx::i2c::writeRegister8(1, 0x43, 0x07, 0x00, 0, 400000); // push-pull
+  switcher.restore();
+  Serial.println("ATOMS3R: NS4150B PA enabled via PI4IOE (0x43)");
+}
+#endif
 
 Preferences prefs;
 WebSocketsClient ws;
@@ -52,7 +69,7 @@ std::atomic<bool> hermesNotification{false};
 int batteryPercent=-1;
 float batteryVoltage=0;
 uint32_t lastBatterySample=0;
-constexpr uint32_t IDLE_SLEEP_MS=120000;
+constexpr uint32_t IDLE_SLEEP_MS=300000;
 uint32_t lastActivity=0;
 volatile bool sleepRequested=false,audioPaused=false;
 volatile bool hermesPaused=false,hermesPending=false;
@@ -60,6 +77,11 @@ SemaphoreHandle_t sleepScreenReady=nullptr;
 
 
 void sampleBattery(){
+#ifdef BOARD_M5STACK_ATOMS3R
+  int lvl = M5.Power.getBatteryLevel();
+  if (lvl >= 0 && lvl <= 100) batteryPercent = lvl;
+  else batteryPercent = -1;
+#else
   // Waveshare's ADC example: ADC1 channel 3 (GPIO4), 2:1 divider.
   uint32_t total=0;for(int i=0;i<16;i++)total+=analogReadMilliVolts(4);
   float voltage=total/16.0f*0.002f;
@@ -73,6 +95,7 @@ void sampleBattery(){
   else for(int i=1;i<11;i++)if(batteryVoltage<=volts[i]){estimate=lroundf(percent[i-1]+(batteryVoltage-volts[i-1])*(percent[i]-percent[i-1])/(volts[i]-volts[i-1]));break;}
   batteryPercent=constrain(estimate,0,100);
   Serial.printf("GEMINI_BATTERY: voltage=%.3f estimate=%d%%\n",batteryVoltage,batteryPercent);
+#endif
 }
 
 bool lastUsbConnected=false;
@@ -92,6 +115,149 @@ void status(const String &s) {
   xQueueOverwrite(screenQueue,text);
 }
 
+#ifdef BOARD_M5STACK_ATOMS3R
+void renderAtomScreen(M5Canvas &c, const char *text) {
+  c.fillScreen(c.color565(12, 14, 22));
+  bool listening = strcmp(text, "Listening") == 0;
+  bool speaking = strcmp(text, "Speaking") == 0;
+  bool sleeping = strcmp(text, "Light sleep") == 0;
+  bool connectingHotspot = strstr(text, "Connecting hotspot") || strstr(text, "Switching to hotspot");
+  bool connectingWifi = strstr(text, "Connecting home") || strstr(text, "Switching to home") || strstr(text, "Connecting Wi-Fi");
+  bool connected = !sleeping && WiFi.status() == WL_CONNECTED && !connectingHotspot && !connectingWifi;
+
+  // Header separator
+  c.drawFastHLine(6, 17, 116, c.color565(32, 38, 55));
+
+  // Wi-Fi Icon (Left)
+  if (selectedHotspot) {
+    c.drawRoundRect(8, 4, 10, 11, 2, c.color565(255, 160, 0));
+    c.drawFastHLine(11, 13, 4, c.color565(255, 160, 0));
+  } else {
+    uint16_t wifiCol = connected ? c.color565(0, 229, 255) : (connectingWifi ? c.color565(255, 180, 0) : c.color565(200, 50, 50));
+    c.fillCircle(13, 13, 1, wifiCol);
+    c.drawCircle(13, 13, 4, wifiCol);
+    c.drawCircle(13, 13, 7, wifiCol);
+    c.fillRect(6, 14, 15, 8, c.color565(12, 14, 22));
+    if (!connected && !connectingWifi) c.drawLine(8, 6, 18, 14, c.color565(255, 50, 50));
+  }
+
+  // Hermes Bell (Center)
+  if (hermesNotification.load()) {
+    uint16_t gold = c.color565(255, 215, 0);
+    c.fillRoundRect(60, 3, 9, 8, 4, gold);
+    c.fillTriangle(58, 10, 70, 10, 64, 13, gold);
+    c.fillCircle(64, 14, 1, gold);
+  }
+
+  // Battery / Power (Right)
+  bool usb = HWCDC::isPlugged();
+  if (usb) {
+    c.drawLine(104, 3, 101, 8, c.color565(0, 229, 255));
+    c.drawLine(101, 8, 106, 8, c.color565(0, 229, 255));
+    c.drawLine(106, 8, 103, 14, c.color565(0, 229, 255));
+  }
+  c.drawRect(108, 5, 14, 8, c.color565(160, 170, 190));
+  c.drawFastVLine(122, 7, 4, c.color565(160, 170, 190));
+  if (batteryPercent < 0) {
+    c.fillRect(110, 7, 10, 4, c.color565(0, 229, 255));
+  } else {
+    int w = constrain(batteryPercent * 10 / 100, 1, 10);
+    uint16_t bcol = batteryPercent > 20 ? c.color565(0, 230, 118) : c.color565(255, 60, 60);
+    c.fillRect(110, 7, w, 4, bcol);
+  }
+
+  // Hero Graphic (Center at x=64, y=52)
+  if (listening) {
+    c.drawCircle(64, 52, 28, c.color565(10, 60, 120));
+    c.drawCircle(64, 52, 23, c.color565(0, 180, 255));
+    c.fillCircle(64, 52, 17, c.color565(0, 229, 255));
+    c.fillCircle(59, 49, 2, c.color565(12, 14, 22));
+    c.fillCircle(69, 49, 2, c.color565(12, 14, 22));
+    c.drawCircle(64, 51, 6, c.color565(12, 14, 22));
+    c.fillRect(57, 45, 14, 6, c.color565(0, 229, 255));
+  } else if (speaking) {
+    c.drawCircle(64, 52, 34, c.color565(0, 100, 60));
+    c.drawCircle(64, 52, 26, c.color565(0, 180, 90));
+    c.fillCircle(64, 52, 18, c.color565(0, 230, 118));
+    c.fillCircle(59, 48, 2, c.color565(12, 14, 22));
+    c.fillCircle(69, 48, 2, c.color565(12, 14, 22));
+    c.fillRoundRect(61, 54, 7, 7, 3, c.color565(12, 14, 22));
+  } else if (sleeping) {
+    c.fillCircle(60, 52, 17, c.color565(171, 71, 188));
+    c.fillCircle(66, 48, 15, c.color565(12, 14, 22));
+    c.setTextColor(c.color565(206, 147, 216));
+    c.setTextDatum(MC_DATUM);
+    c.setTextSize(1);
+    c.drawString("z", 76, 44);
+    c.drawString("Z", 85, 34);
+  } else {
+    // Gemini Diamond Sparkle
+    uint16_t geminiBlue = c.color565(78, 136, 255);
+    uint16_t geminiPurple = c.color565(162, 89, 255);
+    c.fillTriangle(64, 31, 59, 52, 69, 52, geminiBlue);
+    c.fillTriangle(64, 73, 59, 52, 69, 52, geminiPurple);
+    c.fillTriangle(43, 52, 64, 47, 64, 57, geminiBlue);
+    c.fillTriangle(85, 52, 64, 47, 64, 57, geminiPurple);
+    c.fillCircle(64, 52, 4, c.color565(255, 255, 255));
+  }
+
+  // Status Label (y = 94)
+  c.setTextDatum(MC_DATUM);
+  c.setTextSize(1);
+  if (listening) {
+    c.setTextColor(c.color565(0, 229, 255));
+    c.drawString("Listening...", 64, 94);
+  } else if (speaking) {
+    c.setTextColor(c.color565(0, 230, 118));
+    c.drawString("Speaking...", 64, 94);
+  } else if (sleeping) {
+    c.setTextColor(c.color565(171, 71, 188));
+    c.drawString("Light Sleep", 64, 94);
+  } else if (connectingHotspot || connectingWifi) {
+    c.setTextColor(c.color565(255, 180, 0));
+    c.drawString(connectingHotspot ? "Hotspot..." : "Connecting...", 64, 94);
+  } else if (strstr(text, "failed") || strstr(text, "Failed") || strstr(text, "Error")) {
+    c.setTextColor(c.color565(255, 82, 82));
+    c.drawString("Conn Failed", 64, 94);
+  } else {
+    c.setTextColor(c.color565(255, 255, 255));
+    c.drawString("Gemini Live", 64, 94);
+  }
+
+  // Bottom Pill Bar (y = 108 to 124)
+  c.fillRoundRect(8, 108, 112, 16, 4, c.color565(22, 26, 38));
+  c.drawRoundRect(8, 108, 112, 16, 4, c.color565(40, 48, 70));
+  c.setTextColor(c.color565(180, 190, 210));
+  c.setTextDatum(MC_DATUM);
+  c.setTextSize(1);
+  if (listening || speaking) {
+    c.drawString("Click: Stop", 64, 116);
+  } else if (sleeping) {
+    c.drawString("Click: Wake", 64, 116);
+  } else {
+    char pill[32];
+    snprintf(pill, sizeof(pill), "Click: Talk (%d%%)", volume);
+    c.drawString(pill, 64, 116);
+  }
+}
+
+void screenTask(void*) {
+  M5Canvas canvas(&M5.Lcd);
+  canvas.createSprite(128, 128);
+  canvas.setTextWrap(false);
+  char text[96];
+  for(;;) {
+    if (xQueueReceive(screenQueue, text, portMAX_DELAY)) {
+      bool sleeping = strcmp(text, "Light sleep") == 0;
+      renderAtomScreen(canvas, text);
+      canvas.pushSprite(0, 0);
+      if (sleeping) {
+        if (sleepScreenReady) xSemaphoreGive(sleepScreenReady);
+      }
+    }
+  }
+}
+#else
 // Monochrome vector artwork: round strokes stay crisp on the e-paper panel.
 void iconStroke(GFXcanvas1 &c,int x1,int y1,int x2,int y2,int width=5) {
   int steps=max(abs(x2-x1),abs(y2-y1));
@@ -206,6 +372,7 @@ void screenTask(void*) {
     if(sleeping){display.EPD_Sleep();digitalWrite(6,HIGH);panelAsleep=true;xSemaphoreGive(sleepScreenReady);}
   }
 }
+#endif
 
 void clearAudio() {
   xSemaphoreTake(audioMutex,portMAX_DELAY);
@@ -367,14 +534,17 @@ void socketEvent(WStype_t type,uint8_t *data,size_t len) {
 }
 void startSession() {
   lastActivity=millis();
-  if(!configured){status("Enter setup on Mac");return;}
-  if(WiFi.status()!=WL_CONNECTED){status("Wi-Fi unavailable");return;}
-  if(!audioReady){status("Audio unavailable");return;}
-  if(time(nullptr)<1700000000){status("Waiting for clock");return;}
+  Serial.printf("START_SESSION_REQ: configured=%d, wifi=%d, audioReady=%d, time=%ld\n",
+                configured, WiFi.status()==WL_CONNECTED, audioReady, (long)time(nullptr));
+  if(!configured){status("Enter setup on Mac");Serial.println("START_ABORT: Not configured (run tools/configure.py)");return;}
+  if(WiFi.status()!=WL_CONNECTED){status("Wi-Fi unavailable");Serial.println("START_ABORT: Wi-Fi not connected yet");return;}
+  if(!audioReady){status("Audio unavailable");Serial.println("START_ABORT: Audio codec/AEC not ready");return;}
+  if(time(nullptr)<1700000000){status("Waiting for clock");Serial.println("START_ABORT: Waiting for NTP time sync");return;}
   clearAudio();wanted=true;live=false;connectStarted=millis();
   String path="/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key="+apiKey;
   ws.beginSslWithCA("generativelanguage.googleapis.com",443,path.c_str(),GOOGLE_ROOTS,"");
   ws.setReconnectInterval(0);status("Connecting Gemini");
+  Serial.println("START_SESSION: Connecting to Gemini Live WebSocket...");
 }
 void connectWifi() {
   WiFi.mode(WIFI_STA);WiFi.begin((selectedHotspot?backupSsid:ssid).c_str(),(selectedHotspot?backupPassword:password).c_str());
@@ -395,7 +565,13 @@ void readSetup() {
     if(c=='\n') {
       JsonDocument doc;auto err=deserializeJson(doc,serialLine);serialLine="";
       if(err)continue;
-      if(doc["command"]=="start_session") {lastActivity=millis();if(!wanted)startSession();continue;}
+      if(doc["command"]=="start_session" || doc["command"]=="click") {
+        lastActivity=millis();
+        Serial.println("SERIAL COMMAND: start_session / click");
+        if(wanted) stopSession(selectedHotspot?"Hotspot ready. Click":"Home Wi-Fi ready. Click");
+        else startSession();
+        continue;
+      }
       if(doc["command"]=="stop_session") {stopSession("Ready. Click BOOT");continue;}
       if(doc["command"]=="test_prompt") {
         lastActivity=millis();String prompt=doc["text"] | "";
@@ -441,6 +617,21 @@ void readSetup() {
   }
 }
 void setup() {
+#ifdef BOARD_M5STACK_ATOMS3R
+  auto m5cfg = M5.config();
+  m5cfg.internal_spk = false;
+  m5cfg.internal_mic = false;
+  m5cfg.external_speaker.atomic_echo = 1;
+  M5.begin(m5cfg);
+  pinMode(41, INPUT_PULLUP);
+  pinMode(0, INPUT_PULLUP);
+  M5.Lcd.setRotation(0);
+  M5.Lcd.setBrightness(128);
+  sampleBattery();
+  lastBatterySample=millis();
+  lastUsbConnected=HWCDC::isPlugged();
+  Serial.begin(115200);
+#else
   // Waveshare ESP32-S3-ePaper-1.54 V2: keep battery power latched on.
   // Assert before USB logging and peripheral startup so PWR can be released.
   pinMode(17,OUTPUT);
@@ -448,18 +639,28 @@ void setup() {
   analogReadResolution(12);analogSetPinAttenuation(4,ADC_11db);
   sampleBattery();lastBatterySample=millis();lastUsbConnected=HWCDC::isPlugged();
   Serial.begin(115200);delay(1500);pinMode(0,INPUT_PULLUP);pinMode(18,INPUT_PULLUP);
+#endif
   WiFi.onEvent([](WiFiEvent_t,WiFiEventInfo_t info){wifiFailureReason=info.wifi_sta_disconnected.reason;},ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   prefs.begin("gemini",false);volume=constrain((int)prefs.getUChar("volume",55),0,100);
   sleepScreenReady=xSemaphoreCreateBinary();
   screenQueue=xQueueCreate(1,96);toneQueue=xQueueCreate(4,sizeof(int));audioMutex=xSemaphoreCreateMutex();
   audioRing=(uint8_t*)ps_malloc(AUDIO_CAP);
   xTaskCreatePinnedToCore(screenTask,"screen",8192,nullptr,1,nullptr,1);
+
+#ifdef BOARD_M5STACK_ATOMS3R
+  set_codec_board_type("AtomS3R_Voice");
+#else
   pinMode(42,OUTPUT);digitalWrite(42,LOW);delay(100);
   set_codec_board_type("S3_ePaper_1_54");
+#endif
+
   codec_init_cfg_t cfg={CODEC_I2S_MODE_STD,CODEC_I2S_MODE_STD,false,false};
   int codecResult=init_codec(&cfg);
   Serial.printf("AUDIO INIT: codec=%d, ring=%d, free RAM=%u\n",codecResult,audioRing!=nullptr,ESP.getFreeHeap());
   if(codecResult==0) {
+#ifdef BOARD_M5STACK_ATOMS3R
+    enableAtomVoiceAmp();
+#endif
     mic=get_record_handle();speaker=get_playback_handle();
     esp_codec_dev_sample_info_t fmt={};fmt.sample_rate=16000;fmt.channel=2;fmt.bits_per_sample=16;
     int speakerResult=esp_codec_dev_open(speaker,&fmt);
@@ -507,6 +708,30 @@ void enterIdleSleep() {
   status("Light sleep");
   bool screenReady=xSemaphoreTake(sleepScreenReady,pdMS_TO_TICKS(15000))==pdTRUE;
   esp_err_t result=ESP_FAIL;
+#ifdef BOARD_M5STACK_ATOMS3R
+  M5.Lcd.setBrightness(0);
+  M5.Lcd.sleep();
+  if(screenReady&&digitalRead(41)==HIGH){
+    gpio_config_t io_conf = {
+      .pin_bit_mask = (1ULL << GPIO_NUM_41) | (1ULL << GPIO_NUM_0),
+      .mode = GPIO_MODE_INPUT,
+      .pull_up_en = GPIO_PULLUP_ENABLE,
+      .pull_down_en = GPIO_PULLDOWN_DISABLE,
+      .intr_type = GPIO_INTR_LOW_LEVEL
+    };
+    gpio_config(&io_conf);
+    result=gpio_wakeup_enable(GPIO_NUM_41,GPIO_INTR_LOW_LEVEL);
+    gpio_wakeup_enable(GPIO_NUM_0,GPIO_INTR_LOW_LEVEL);
+    if(result==ESP_OK)result=esp_sleep_enable_gpio_wakeup();
+    if(result==ESP_OK){
+      Serial.println("LIGHT_SLEEP_ENTER: AtomS3R button wakes device");Serial.flush();
+      result=esp_light_sleep_start();
+    }
+    gpio_wakeup_disable(GPIO_NUM_41);gpio_wakeup_disable(GPIO_NUM_0);esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+  }
+  M5.Lcd.wakeup();
+  M5.Lcd.setBrightness(128);
+#else
   if(screenReady&&digitalRead(0)==HIGH){
     result=gpio_wakeup_enable(GPIO_NUM_0,GPIO_INTR_LOW_LEVEL);
     if(result==ESP_OK)result=esp_sleep_enable_gpio_wakeup();
@@ -518,6 +743,7 @@ void enterIdleSleep() {
     }
     gpio_wakeup_disable(GPIO_NUM_0);esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
   }
+#endif
   if(audioReady){
     esp_codec_dev_sample_info_t fmt={};fmt.sample_rate=16000;fmt.channel=2;fmt.bits_per_sample=16;
     int out=esp_codec_dev_open(speaker,&fmt),in=esp_codec_dev_open(mic,&fmt);
@@ -532,7 +758,11 @@ void enterIdleSleep() {
   // Keep workers parked on failure to reopen audio rather than spin on closed handles.
   if(!audioReady&&audioPaused){Serial.println("ERROR: restarting to recover audio");ESP.restart();}
   sleepRequested=false;
+#ifdef BOARD_M5STACK_ATOMS3R
+  while(digitalRead(41)==LOW)delay(10);
+#else
   while(digitalRead(0)==LOW)delay(10);
+#endif
   lastButton=stableButton=HIGH;buttonChanged=millis();bootLongHandled=false;wifiRestartPending=false;
   lastActivity=millis();lastBatterySample=millis();
   if(configured)connectWifi();else status("Enter setup on Mac");
@@ -563,6 +793,7 @@ void loop() {
   }else if(n==WIFI_SCAN_FAILED){Serial.println("HOTSPOT SCAN: failed");wifiDiagnosticScan=false;}}
 
   pumpHermes();
+#ifndef BOARD_M5STACK_ATOMS3R
   handleVolumeButton();
   bool button=digitalRead(0);
   if(button!=lastButton){lastActivity=millis();lastButton=button;buttonChanged=millis();}
@@ -572,6 +803,45 @@ void loop() {
     else if(!bootLongHandled){buttonTone(wanted?440:880);if(wanted)stopSession(selectedHotspot?"Hotspot ready. BOOT":"Home Wi-Fi ready. BOOT");else {hermesNotification.store(false);startSession();}}
   }
   if(stableButton==LOW&&!bootLongHandled&&millis()-bootPressed>=3000){bootLongHandled=true;selectOtherWifi();}
+#else
+  M5.update();
+  bool button = (digitalRead(41) == LOW) || M5.BtnA.isPressed();
+  if (button != lastButton) {
+    lastActivity = millis();
+    lastButton = button;
+    buttonChanged = millis();
+  }
+  if (button != stableButton && millis() - buttonChanged > 40) {
+    stableButton = button;
+    if (button) {
+      bootPressed = millis();
+      bootLongHandled = false;
+      Serial.println("BUTTON EVENT: Screen pressed down");
+    } else if (!bootLongHandled) {
+      Serial.println("BUTTON EVENT: Screen clicked!");
+      buttonTone(wanted ? 440 : 880);
+      if (wanted) {
+        stopSession(selectedHotspot ? "Hotspot ready. Click" : "Home Wi-Fi ready. Click");
+      } else {
+        hermesNotification.store(false);
+        startSession();
+      }
+    }
+  }
+  if (stableButton && !bootLongHandled && millis() - bootPressed >= 2500) {
+    bootLongHandled = true;
+    Serial.println("BUTTON EVENT: Screen held long (switching Wi-Fi)");
+    selectOtherWifi();
+  }
+  if (M5.BtnA.wasDoubleClicked()) {
+    lastActivity = millis();
+    int newVol = volume + 15;
+    if (newVol > 100) newVol = 40;
+    Serial.printf("BUTTON EVENT: Double click (volume %d%%)\n", newVol);
+    changeVolume(newVol - volume);
+  }
+#endif
+
   if(wanted)ws.loop();
   if(wanted&&!live&&millis()-connectStarted>20000)stopSession("Connection timeout");
   if(live&&millis()-sessionStarted>5*60*1000)stopSession("5 min ended. Click BOOT");
@@ -588,7 +858,12 @@ void loop() {
   }
   if(live&&!generating&&!playing&&lastScreen=="Speaking")status("Listening");
   if(wanted||hermesPending||playing||wifiDiagnosticScan||!configured||WiFi.status()!=WL_CONNECTED)lastActivity=millis();
+#ifdef BOARD_M5STACK_ATOMS3R
+  if(!wanted&&!hermesPending&&!playing&&!wifiDiagnosticScan&&configured&&WiFi.status()==WL_CONNECTED&&
+     digitalRead(41)==HIGH&&millis()-lastActivity>=IDLE_SLEEP_MS)enterIdleSleep();
+#else
   if(!wanted&&!hermesPending&&!playing&&!wifiDiagnosticScan&&configured&&WiFi.status()==WL_CONNECTED&&
      digitalRead(0)==HIGH&&digitalRead(18)==HIGH&&millis()-lastActivity>=IDLE_SLEEP_MS)enterIdleSleep();
+#endif
   delay(1);
 }
