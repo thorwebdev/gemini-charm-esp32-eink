@@ -39,13 +39,15 @@ The included TLS trust root is ISRG Root X1. Your backend certificate must chain
 
 ## 5. Start a conversation
 
-- Short BOOT press: start/stop Gemini Live; press BOOT to wake from idle light sleep.
+- Short BOOT press (or front screen press on AtomS3R): start/stop Gemini Live; press to wake from idle light sleep.
 - Speak after the display shows Listening. Ask an ordinary question first.
 - With Hermes configured, ask for an action supported by your backend. Routing is model-driven.
 - Bell: a Hermes completion/approval event arrived; result remains queued for a Live session.
-- Volume button: short press increases volume; long press decreases volume.
+- Volume control:
+  - Waveshare: short press volume button to increase; long press to decrease.
+  - AtomS3R: double-click the front screen button to cycle through volume levels (30%, 50%, 75%, 90%, 100%).
 
-The firmware sleeps after about two idle minutes when no session/task is active. Serial diagnostics include spoken response text and task information; keep logs private.
+The firmware sleeps after idle inactivity when no session or background task is active (woken by BOOT / screen press). Serial diagnostics include spoken response text and task information; keep logs private.
 
 ## 6. Optional: save backup Wi-Fi
 
@@ -53,10 +55,36 @@ The firmware sleeps after about two idle minutes when no session/task is active.
 python tools/configure.py --port PORT --mode backup-wifi
 ```
 
-Hold BOOT for about three seconds to switch between primary and backup Wi-Fi. Use a 2.4 GHz compatible hotspot. To return explicitly to primary Wi-Fi, send `{"command":"select_primary_wifi"}` over a 115200-baud serial monitor with newline enabled.
+Hold BOOT (or screen button on AtomS3R) for about three seconds to switch between primary and backup Wi-Fi. Use a 2.4 GHz compatible hotspot. To return explicitly to primary Wi-Fi, send `{"command":"select_primary_wifi"}` over a 115200-baud serial monitor with newline enabled.
 
-## 7. Troubleshoot
+## 7. Monitor serial logs
 
+To monitor real-time logs, diagnostics, spoken response text, and connection events:
+
+```sh
+arduino-cli monitor -p PORT -c baudrate=115200
+```
+
+For example, on macOS:
+
+```sh
+arduino-cli monitor -p /dev/cu.usbmodem2101 -c baudrate=115200
+```
+
+Press `Ctrl+C` to stop monitoring.
+
+Alternatively, you can run the included Python monitor helper, which lets you view logs and interactively send serial commands (such as typing `click` to simulate pressing the button or `diag` for Wi-Fi diagnostics):
+
+```sh
+python tools/monitor.py --port PORT
+```
+
+> [!NOTE]
+> Close any active serial monitor before running `arduino-cli upload` or `python tools/configure.py`, as the serial port cannot be opened by multiple programs at the same time.
+
+## 8. Troubleshoot
+
+- Check live logs: run `arduino-cli monitor -p PORT -c baudrate=115200` to inspect connection logs, Wi-Fi errors, and API responses.
 - Missing `local_config.h`: copy the example as described in the build guide.
 - Upload fails: check the USB data cable, board port and BOOT/RESET sequence; close serial monitors.
 - `CONFIG_INVALID`: Wi-Fi name cannot be empty; Gemini key must have at least 20 characters.
@@ -65,3 +93,4 @@ Hold BOOT for about three seconds to switch between primary and backup Wi-Fi. Us
 - Audio/display errors: confirm original hardware, pins and OPI PSRAM settings.
 
 Microphone recognition needs a physical test on your board; successful compilation does not prove audio behavior.
+

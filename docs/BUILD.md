@@ -2,13 +2,15 @@
 
 ## 1. Hardware
 
-Use the original compatible ESP32-S3 board: 8 MB flash, 8 MB OPI PSRAM, ES8311 speaker codec, ES7210 microphone codec and 200×200 e-paper panel. A generic ESP32-S3 without these peripherals needs driver/pin adaptations.
+Supported boards:
 
-Display pins: CS 11, DC 10, RESET 9, BUSY 8, MOSI 13, clock 12, power control 6. BOOT button: GPIO 0. Volume button: GPIO 18. Audio wiring is defined in the sketch's `setup()` and bundled codec configuration. Check wiring against your actual board before powering it.
+- **Waveshare ESP32-S3 e-Paper Board (Default)**: 8 MB flash, 8 MB OPI PSRAM, ES8311 speaker codec, ES7210 microphone codec and 200×200 e-paper panel. Display pins: CS 11, DC 10, RESET 9, BUSY 8, MOSI 13, clock 12, power control 6. BOOT button: GPIO 0. Volume button: GPIO 18.
+- **M5Stack AtomS3R AI Chatbot Kit**: ESP32-S3-PICO-1-N8R8 (8 MB PSRAM) + Atomic Voice Base (ES8311 codec + NS4150B amplifier via PI4IOE expander on I2C `0x43`, 128×128 color IPS LCD GC9107). Button: GPIO 41 (front screen). Enabled via `#define BOARD_M5STACK_ATOMS3R` in `Gemini_Live/Gemini_Live.ino`.
 
 ### Purchase options
 
-- [Amazon](https://www.amazon.com/dp/B0GV417JB7)
+- [Waveshare on Amazon](https://www.amazon.com/dp/B0GV417JB7)
+- [M5Stack AtomS3R AI Chatbot Kit](https://shop.m5stack.com/products/atoms3r-ai-chatbot-kit-8mb-psram)
 
 ## 2. Install tools
 
@@ -69,6 +71,22 @@ arduino-cli upload --port PORT --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc,PSRAM=op
 
 Close serial monitors before uploading. Do not select `/dev/cu.debug-console`. If connecting fails, hold BOOT, press/release RESET, release BOOT, then retry. Upload replaces firmware; keep any existing full-device backup outside this repository. Existing NVS credentials can remain after a normal upload, so setup may already be present.
 
+## 7. Monitor serial output
+
+To view live runtime logs and debug output from the device:
+
+```sh
+arduino-cli monitor -p PORT -c baudrate=115200
+```
+
+For example, on macOS:
+
+```sh
+arduino-cli monitor -p /dev/cu.usbmodem2101 -c baudrate=115200
+```
+
+Press `Ctrl+C` to exit the monitor. Close the serial monitor before uploading new firmware or configuring credentials.
+
 Next: [configure and run](SETUP.md).
 
 Reference: [Arduino CLI getting started](https://docs.arduino.cc/arduino-cli/getting-started/).
@@ -76,3 +94,4 @@ Reference: [Arduino CLI getting started](https://docs.arduino.cc/arduino-cli/get
 ## Export validation
 
 The sanitized source compiled successfully using the versions above: 1,383,043 bytes of program storage (43% of the Huge APP partition), 48,676 bytes of global RAM (14%). The placeholder backend cannot execute tasks until configured. No device was flashed or physically tested during export.
+

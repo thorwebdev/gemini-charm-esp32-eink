@@ -44,7 +44,13 @@ Images from the [project blog post](https://www.cloud-monk.com/blog/going-screen
 - [Step-by-step setup and use](docs/SETUP.md)
 - [Privacy and export details](docs/PRIVACY.md)
 
-This is device firmware; it runs on the matching ESP32-S3 hardware. Hermes is an optional backend placeholder. You can replace it with any agent through a compatible API or adapter; see [agent backend interface](docs/AGENT_BACKEND.md). The backend is a separate service and is not included. Included vendor sources retain their original licenses. No new license is granted for the application code.
+Tail live runtime logs and debug output from the device at any time with:
+
+```sh
+arduino-cli monitor -p PORT -c baudrate=115200
+```
+
+This device firmware supports both the original Waveshare ESP32-S3 e-Paper board and the M5Stack AtomS3R AI Chatbot Kit. Hermes is an optional backend placeholder. You can replace it with any agent through a compatible API or adapter; see [agent backend interface](docs/AGENT_BACKEND.md). The backend is a separate service and is not included. Included vendor sources retain their original licenses. No new license is granted for the application code.
 
 The saved v3.2 checkpoint reports successful compilation, flash verification, direct-answer and Hermes-delegation tests. Microphone recognition was not verified in that checkpoint. This export makes the original personal Hermes URL configurable; the rest of the saved firmware is preserved. No hardware is flashed during export.
 
