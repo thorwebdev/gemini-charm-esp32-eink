@@ -17,9 +17,10 @@
 #include "resample_filter.h"
 #include "src/codec_board/codec_board.h"
 #include "src/codec_board/codec_init.h"
-#define BOARD_M5STACK_ATOMS3R
-// Uncomment below to force CAM mode, or leave commented for runtime auto-detection via M5Unified:
-// #define BOARD_M5STACK_ATOMS3R_CAM
+// Select hardware platform (uncomment one):
+// #define BOARD_WAVESHARE_EPAPER
+// #define BOARD_M5STACK_ATOMS3R
+#define BOARD_M5STACK_ATOMS3R_CAM
 
 #if defined(BOARD_M5STACK_ATOMS3R) || defined(BOARD_M5STACK_ATOMS3R_CAM)
 #define USING_M5STACK
@@ -48,7 +49,7 @@ void enableAtomVoiceAmp() {
 bool initCamera() {
   pinMode(18, OUTPUT);
   digitalWrite(18, LOW); // Powers on GC0308 camera module on AtomS3R CAM
-  delay(100);
+  delay(500);
 
   camera_config_t config = {};
   config.pin_pwdn = -1;
@@ -76,13 +77,20 @@ bool initCamera() {
   config.fb_count = 2;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.grab_mode = CAMERA_GRAB_LATEST;
+  config.sccb_i2c_port = 0;
 
   esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("CAMERA: 20MHz init failed with error 0x%x, retrying at 10MHz...\n", err);
+    config.xclk_freq_hz = 10000000;
+    err = esp_camera_init(&config);
+  }
   if (err != ESP_OK) {
     Serial.printf("CAMERA: Init failed with error 0x%x\n", err);
     return false;
   }
   Serial.println("CAMERA: GC0308 initialized at 320x240 (QVGA) - 1 FPS live ingestion ready");
+  return true;
 }
 #endif
 
@@ -126,8 +134,8 @@ SemaphoreHandle_t sleepScreenReady=nullptr;
 
 
 void sampleBattery(){
-#ifdef BOARD_M5STACK_ATOMS3R
-  int lvl = M5.Power.getBatteryLevel();
+#ifdef USING_M5STACK
+  int lvl = hasScreen ? M5.Power.getBatteryLevel() : -1;
   if (lvl >= 0 && lvl <= 100) batteryPercent = lvl;
   else batteryPercent = -1;
 #else
@@ -164,7 +172,7 @@ void status(const String &s) {
   xQueueOverwrite(screenQueue,text);
 }
 
-#ifdef BOARD_M5STACK_ATOMS3R
+#ifdef USING_M5STACK
 void renderAtomScreen(M5Canvas &c, const char *text) {
   c.fillScreen(c.color565(12, 14, 22));
   bool listening = strcmp(text, "Listening") == 0;
@@ -751,28 +759,37 @@ void readSetup() {
   }
 }
 void setup() {
+  Serial.begin(115200);
 #ifdef USING_M5STACK
+#if defined(BOARD_M5STACK_ATOMS3R_CAM)
+  hasCamera = true;
+  hasScreen = false;
+  Serial.println("BOARD: Configured for M5Stack AtomS3R-CAM (Camera Edition)");
+  // Power on camera sensor early and initialize camera without M5Unified screen conflict
+  if (!initCamera()) {
+    Serial.println("CAMERA: Failed to initialize camera hardware");
+    hasCamera = false;
+  }
+#else
   auto m5cfg = M5.config();
   m5cfg.internal_spk = false;
   m5cfg.internal_mic = false;
   m5cfg.external_speaker.atomic_echo = 1;
   M5.begin(m5cfg);
 
-#if defined(BOARD_M5STACK_ATOMS3R_CAM)
-  hasCamera = true;
-  hasScreen = false;
-  Serial.println("BOARD: Configured for M5Stack AtomS3R-CAM (Camera Edition)");
-#else
   if (M5.getBoard() == m5::board_t::board_M5AtomS3RCam) {
     hasCamera = true;
     hasScreen = false;
     Serial.println("BOARD: Auto-detected M5Stack AtomS3R-CAM (Camera Edition)");
+    if (!initCamera()) {
+      Serial.println("CAMERA: Failed to initialize camera hardware");
+      hasCamera = false;
+    }
   } else {
     hasCamera = false;
     hasScreen = true;
     Serial.println("BOARD: Auto-detected M5Stack AtomS3R (Display Edition)");
   }
-#endif
 
   if (hasScreen) {
     pinMode(41, INPUT_PULLUP);
@@ -780,14 +797,11 @@ void setup() {
     M5.Lcd.setRotation(0);
     M5.Lcd.setBrightness(128);
   }
-  if (hasCamera) {
-    initCamera();
-  }
+#endif
 
   sampleBattery();
   lastBatterySample=millis();
   lastUsbConnected=HWCDC::isPlugged();
-  Serial.begin(115200);
 #else
   // Waveshare ESP32-S3-ePaper-1.54 V2: keep battery power latched on.
   // Assert before USB logging and peripheral startup so PWR can be released.
@@ -808,7 +822,9 @@ void setup() {
   sleepScreenReady=xSemaphoreCreateBinary();
   screenQueue=xQueueCreate(1,96);toneQueue=xQueueCreate(4,sizeof(int));audioMutex=xSemaphoreCreateMutex();
   audioRing=(uint8_t*)ps_malloc(AUDIO_CAP);
-  xTaskCreatePinnedToCore(screenTask,"screen",8192,nullptr,1,nullptr,1);
+  if (hasScreen) {
+    xTaskCreatePinnedToCore(screenTask,"screen",8192,nullptr,1,nullptr,1);
+  }
 
 #ifdef USING_M5STACK
   set_codec_board_type("AtomS3R_Voice");
@@ -980,8 +996,8 @@ void loop() {
   }
   if(stableButton==LOW&&!bootLongHandled&&millis()-bootPressed>=3000){bootLongHandled=true;selectOtherWifi();}
 #else
-  M5.update();
   if (hasScreen) {
+    M5.update();
     bool button = (digitalRead(41) == LOW) || M5.BtnA.isPressed();
     if (button != lastButton) {
       lastActivity = millis();
