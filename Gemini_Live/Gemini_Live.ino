@@ -37,19 +37,42 @@ bool hasCamera = false;
 bool hasScreen = true;
 uint32_t lastCameraFrame = 0;
 
+#include "driver/i2c_master.h"
+
 void enableAtomVoiceAmp() {
-  m5gfx::i2c::i2c_temporary_switcher_t switcher(1, GPIO_NUM_38, GPIO_NUM_39);
-  m5gfx::i2c::writeRegister8(1, 0x43, 0x03, 0xFF, 0, 400000); // IO direction: output
-  m5gfx::i2c::writeRegister8(1, 0x43, 0x05, 0xFF, 0, 400000); // output HIGH (enable PA)
-  m5gfx::i2c::writeRegister8(1, 0x43, 0x07, 0x00, 0, 400000); // push-pull
-  switcher.restore();
-  Serial.println("ATOMS3R: NS4150B PA enabled via PI4IOE (0x43)");
+  void *bus = get_i2c_bus_handle(0);
+  if (bus) {
+    i2c_device_config_t dev_cfg = {};
+    dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    dev_cfg.device_address = 0x43;
+    dev_cfg.scl_speed_hz = 400000;
+    i2c_master_dev_handle_t dev_handle = NULL;
+    if (i2c_master_bus_add_device((i2c_master_bus_handle_t)bus, &dev_cfg, &dev_handle) == ESP_OK) {
+      uint8_t cmd1[] = {0x03, 0xFF}; // IO direction: output
+      uint8_t cmd2[] = {0x05, 0xFF}; // output HIGH (enable PA)
+      uint8_t cmd3[] = {0x07, 0x00}; // push-pull
+      i2c_master_transmit(dev_handle, cmd1, sizeof(cmd1), 100);
+      i2c_master_transmit(dev_handle, cmd2, sizeof(cmd2), 100);
+      i2c_master_transmit(dev_handle, cmd3, sizeof(cmd3), 100);
+      i2c_master_bus_rm_device(dev_handle);
+      Serial.println("ATOMS3R: NS4150B PA enabled via PI4IOE (0x43)");
+      return;
+    }
+  }
+  Serial.println("ATOMS3R: Warning - failed to get I2C bus 0 handle for PA enable");
 }
+
+#include "esp_log.h"
 
 bool initCamera() {
   pinMode(18, OUTPUT);
   digitalWrite(18, LOW); // Powers on GC0308 camera module on AtomS3R CAM
   delay(500);
+
+  // cam_task has a 2048-byte stack; logging from cam_hal blows the stack canary.
+  esp_log_level_set("cam_hal", ESP_LOG_NONE);
+  esp_log_level_set("camera", ESP_LOG_NONE);
+  esp_log_level_set("sccb", ESP_LOG_NONE);
 
   camera_config_t config = {};
   config.pin_pwdn = -1;
@@ -79,17 +102,25 @@ bool initCamera() {
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.sccb_i2c_port = 0;
 
+  // The bundled esp32-camera is built without CONFIG_CAMERA_PSRAM_DMA, so by default
+  // cam_task copies DMA chunks and silently drops every frame whose length != fb_size
+  // (fb_get then always returns NULL). PSRAM DMA mode writes each frame straight into
+  // the PSRAM framebuffer, triggered only by VSYNC. Must be set before init
+  // (returns ESP_ERR_INVALID_STATE here, which is expected).
+  esp_camera_set_psram_mode(true);
+
   esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("CAMERA: 20MHz init failed with error 0x%x, retrying at 10MHz...\n", err);
-    config.xclk_freq_hz = 10000000;
-    err = esp_camera_init(&config);
-  }
   if (err != ESP_OK) {
     Serial.printf("CAMERA: Init failed with error 0x%x\n", err);
     return false;
   }
-  Serial.println("CAMERA: GC0308 initialized at 320x240 (QVGA) - 1 FPS live ingestion ready");
+
+  sensor_t *s = esp_camera_sensor_get();
+  int pid = -1;
+  if (s && s->get_reg) {
+    pid = s->get_reg(s, 0x00, 0xff);
+  }
+  Serial.printf("CAMERA: GC0308 initialized at 320x240 (QVGA) - PID=0x%02x\n", pid);
   return true;
 }
 #endif
@@ -552,42 +583,224 @@ void stopSession(const String &message) {
 void sendJson(JsonDocument &doc) {String data;serializeJson(doc,data);ws.sendTXT(data);}
 
 #ifdef USING_M5STACK
-void sendCameraFrame() {
-  if (!hasCamera || !live || !ws.isConnected()) return;
+static uint8_t *latestJpegBuf = nullptr;
+static size_t latestJpegSize = 0;
+static SemaphoreHandle_t camJpegMutex = nullptr;
+
+void updateCameraFrame() {
+  if (!hasCamera) return;
   camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) return;
-
-  uint8_t *jpg_buf = nullptr;
-  size_t jpg_len = 0;
-  bool ok = frame2jpg(fb, 75, &jpg_buf, &jpg_len);
-  esp_camera_fb_return(fb);
-
-  if (!ok || !jpg_buf || jpg_len == 0) {
-    if (jpg_buf) free(jpg_buf);
+  if (!fb) {
+    static uint32_t lastErr = 0;
+    if (millis() - lastErr > 3000) {
+      lastErr = millis();
+      sensor_t *s = esp_camera_sensor_get();
+      int pid = -1;
+      if (s && s->get_reg) {
+        pid = s->get_reg(s, 0x00, 0xff);
+      }
+      Serial.printf("CAMERA: fb_get NULL (Sensor PID=0x%02x, free RAM=%u)\n", pid, ESP.getFreeHeap());
+    }
     return;
   }
 
-  size_t b64_max = (jpg_len + 2) / 3 * 4 + 1;
+  uint8_t *jpg_buf = nullptr;
+  size_t jpg_len = 0;
+  // Convert at quality 60 (crisp QVGA, ~8-10 KB, fast encoding)
+  bool ok = frame2jpg(fb, 60, &jpg_buf, &jpg_len);
+  esp_camera_fb_return(fb);
+
+  if (ok && jpg_buf && jpg_len > 0) {
+    if (camJpegMutex && xSemaphoreTake(camJpegMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      if (latestJpegBuf) free(latestJpegBuf);
+      latestJpegBuf = jpg_buf;
+      latestJpegSize = jpg_len;
+      xSemaphoreGive(camJpegMutex);
+      static bool firstOk = false;
+      if (!firstOk) {
+        firstOk = true;
+        Serial.printf("CAMERA: Frame captured and encoded successfully (%u bytes JPEG)\n", (unsigned int)jpg_len);
+      }
+    } else {
+      free(jpg_buf);
+    }
+  } else {
+    static uint32_t lastFail = 0;
+    if (millis() - lastFail > 3000) {
+      lastFail = millis();
+      Serial.println("CAMERA: frame2jpg failed");
+    }
+    if (jpg_buf) free(jpg_buf);
+  }
+}
+
+void sendCameraFrame() {
+  if (!hasCamera || !live || !ws.isConnected()) return;
+  if (!camJpegMutex) return;
+
+  uint8_t *send_buf = nullptr;
+  size_t send_len = 0;
+  if (xSemaphoreTake(camJpegMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    if (latestJpegBuf && latestJpegSize > 0) {
+      send_len = latestJpegSize;
+      send_buf = (uint8_t *)malloc(send_len);
+      if (send_buf) memcpy(send_buf, latestJpegBuf, send_len);
+    }
+    xSemaphoreGive(camJpegMutex);
+  }
+
+  if (!send_buf || send_len == 0) return;
+
+  // mbedtls_base64_encode needs 4*ceil(n/3) bytes + 1 for its own NUL terminator.
+  size_t b64_max = (send_len + 2) / 3 * 4 + 1;
   char *b64_buf = (char *)ps_malloc(b64_max);
   if (!b64_buf) {
-    free(jpg_buf);
+    free(send_buf);
     return;
   }
 
   size_t b64_len = 0;
-  mbedtls_base64_encode((uint8_t *)b64_buf, b64_max - 1, &b64_len, jpg_buf, jpg_len);
+  int rc = mbedtls_base64_encode((uint8_t *)b64_buf, b64_max, &b64_len, send_buf, send_len);
+  free(send_buf);
+  if (rc != 0 || b64_len >= b64_max) {
+    free(b64_buf);
+    return;
+  }
   b64_buf[b64_len] = '\0';
-  free(jpg_buf);
 
+  // Modern Gemini Live API realtimeInput format using "video" (not deprecated mediaChunks)
   String payload;
   payload.reserve(b64_len + 96);
-  payload = "{\"realtimeInput\":{\"mediaChunks\":[{\"mimeType\":\"image/jpeg\",\"data\":\"";
+  payload = "{\"realtimeInput\":{\"video\":{\"mimeType\":\"image/jpeg\",\"data\":\"";
   payload += b64_buf;
-  payload += "\"}]}}";
+  payload += "\"}}}";
   free(b64_buf);
 
   ws.sendTXT(payload);
-  Serial.printf("CAMERA: Ingested 1FPS frame (%u bytes JPEG)\n", (unsigned int)jpg_len);
+  Serial.printf("CAMERA: Ingested 1FPS frame (%u bytes JPEG)\n", (unsigned int)send_len);
+}
+
+#include <WebServer.h>
+
+WebServer camServer(80);
+TaskHandle_t camServerTaskHandle = nullptr;
+
+static const char PROGMEM CAM_INDEX_HTML[] = R"rawliteral(<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AtomS3R-CAM Live Feed</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0b0f19;color:#f0f4fc;margin:0;padding:20px;text-align:center;}
+.card{background:#161e2e;border:1px solid #283548;border-radius:16px;padding:20px;max-width:680px;margin:20px auto;box-shadow:0 12px 36px rgba(0,0,0,0.5);}
+h1{margin:0 0 6px;font-size:22px;color:#38bdf8;}
+.meta{color:#94a3b8;font-size:13px;margin-bottom:16px;}
+.badge{display:inline-block;background:#0284c7;color:#fff;padding:3px 10px;border-radius:999px;font-weight:600;font-size:11px;margin-left:6px;transition:background 0.3s;}
+.viewfinder{border-radius:12px;overflow:hidden;background:#000;border:2px solid #334155;margin-bottom:16px;min-height:240px;display:flex;align-items:center;justify-content:center;}
+img{width:100%;height:auto;display:block;}
+.actions{display:flex;gap:12px;justify-content:center;}
+a.btn{background:#2563eb;color:#fff;text-decoration:none;padding:10px 20px;border-radius:8px;font-weight:500;font-size:14px;transition:background 0.2s;}
+a.btn:hover{background:#1d4ed8;}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>AtomS3R-CAM Live View</h1>
+  <div class="meta">GC0308 Sensor &bull; QVGA (320x240) <span class="badge" id="liveBadge">Connecting...</span></div>
+  <div class="viewfinder">
+    <img id="streamImg" src="/snapshot" alt="Live Camera Feed">
+  </div>
+  <div class="actions">
+    <a href="/snapshot" target="_blank" class="btn">Full Resolution Snapshot</a>
+  </div>
+</div>
+<script>
+const img = document.getElementById('streamImg');
+const badge = document.getElementById('liveBadge');
+let active = true;
+
+function loadNextFrame() {
+  if (!active) return;
+  const next = new Image();
+  next.onload = () => {
+    img.src = next.src;
+    badge.style.background = '#0284c7';
+    badge.innerText = 'Live Feed';
+    setTimeout(loadNextFrame, 300);
+  };
+  next.onerror = () => {
+    badge.style.background = '#e11d48';
+    badge.innerText = 'Retrying...';
+    setTimeout(loadNextFrame, 500);
+  };
+  next.src = '/snapshot?t=' + Date.now();
+}
+loadNextFrame();
+</script>
+</body>
+</html>)rawliteral";
+
+void handleCamIndex() {
+  camServer.send_P(200, "text/html", CAM_INDEX_HTML);
+}
+
+void handleCamSnapshot() {
+  uint8_t *out_buf = nullptr;
+  size_t out_len = 0;
+
+  if (camJpegMutex && xSemaphoreTake(camJpegMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (latestJpegBuf && latestJpegSize > 0) {
+      out_len = latestJpegSize;
+      out_buf = (uint8_t *)malloc(out_len);
+      if (out_buf) memcpy(out_buf, latestJpegBuf, out_len);
+    }
+    xSemaphoreGive(camJpegMutex);
+  }
+
+  if (out_buf && out_len > 0) {
+    camServer.sendHeader("Access-Control-Allow-Origin", "*");
+    camServer.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    camServer.setContentLength(out_len);
+    camServer.send(200, "image/jpeg", "");
+    camServer.client().write(out_buf, out_len);
+    free(out_buf);
+  } else {
+    camServer.send(503, "text/plain", "Frame not ready");
+  }
+}
+
+void camCaptureTask(void *) {
+  for (;;) {
+    updateCameraFrame();
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+void camWebServerTask(void *) {
+  camServer.on("/", HTTP_GET, handleCamIndex);
+  camServer.on("/snapshot", HTTP_GET, handleCamSnapshot);
+  camServer.on("/stream", HTTP_GET, handleCamSnapshot);
+  camServer.begin();
+
+  for (;;) {
+    camServer.handleClient();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+void startCameraWebServer() {
+  if (camServerTaskHandle != nullptr) return;
+  if (!camJpegMutex) camJpegMutex = xSemaphoreCreateMutex();
+  // Pin web server to Core 0 (responsive HTTP server)
+  xTaskCreatePinnedToCore(camWebServerTask, "cam_web", 8192, nullptr, 1, &camServerTaskHandle, 0);
+  // Dedicated capture task on Core 0 so fb_get timeout never delays HTTP responses
+  xTaskCreatePinnedToCore(camCaptureTask, "cam_cap", 8192, nullptr, 1, nullptr, 0);
+  Serial.printf("\n==================================================\n");
+  Serial.printf("📸 CAMERA WEB STREAM READY!\n");
+  Serial.printf("👉 Open in browser: http://%s/\n", WiFi.localIP().toString().c_str());
+  Serial.printf("👉 Snapshot URL:   http://%s/snapshot\n", WiFi.localIP().toString().c_str());
+  Serial.printf("==================================================\n\n");
 }
 #endif
 #include "hermes_bridge.h"
@@ -684,7 +897,9 @@ void startSession() {
   Serial.println("START_SESSION: Connecting to Gemini Live WebSocket...");
 }
 void connectWifi() {
-  WiFi.mode(WIFI_STA);WiFi.begin((selectedHotspot?backupSsid:ssid).c_str(),(selectedHotspot?backupPassword:password).c_str());
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin((selectedHotspot?backupSsid:ssid).c_str(),(selectedHotspot?backupPassword:password).c_str());
   wifiAttempt=millis();status(selectedHotspot?"Connecting hotspot":"Connecting home Wi-Fi");
   configTime(0,0,"time.google.com","pool.ntp.org");
 }
@@ -765,11 +980,9 @@ void setup() {
   hasCamera = true;
   hasScreen = false;
   Serial.println("BOARD: Configured for M5Stack AtomS3R-CAM (Camera Edition)");
-  // Power on camera sensor early and initialize camera without M5Unified screen conflict
-  if (!initCamera()) {
-    Serial.println("CAMERA: Failed to initialize camera hardware");
-    hasCamera = false;
-  }
+  // Power on camera sensor early (GPIO 18 LOW)
+  pinMode(18, OUTPUT);
+  digitalWrite(18, LOW);
 #else
   auto m5cfg = M5.config();
   m5cfg.internal_spk = false;
@@ -781,10 +994,8 @@ void setup() {
     hasCamera = true;
     hasScreen = false;
     Serial.println("BOARD: Auto-detected M5Stack AtomS3R-CAM (Camera Edition)");
-    if (!initCamera()) {
-      Serial.println("CAMERA: Failed to initialize camera hardware");
-      hasCamera = false;
-    }
+    pinMode(18, OUTPUT);
+    digitalWrite(18, LOW);
   } else {
     hasCamera = false;
     hasScreen = true;
@@ -1034,13 +1245,25 @@ void loop() {
       setVolume(newVol);
     }
   } else if (hasCamera) {
-    // AtomS3R CAM: auto-start session once Wi-Fi connects
-    if (configured && WiFi.status() == WL_CONNECTED && !wanted && !live && millis() - wifiAttempt > 2000) {
-      static bool camAutoStarted = false;
-      if (!camAutoStarted) {
-        camAutoStarted = true;
-        Serial.println("CAMERA BOT: Auto-starting Gemini Live session...");
-        startSession();
+    if (WiFi.status() == WL_CONNECTED) {
+      static bool cameraInitialized = false;
+      if (!cameraInitialized) {
+        cameraInitialized = true;
+        if (initCamera()) {
+          startCameraWebServer();
+        } else {
+          Serial.println("CAMERA: Failed to initialize camera hardware");
+          hasCamera = false;
+        }
+      }
+      // AtomS3R CAM: auto-start session once Wi-Fi connects and NTP time is valid
+      if (cameraInitialized && configured && !wanted && !live && time(nullptr) > 1700000000) {
+        static uint32_t lastCamStart = 0;
+        if (millis() - lastCamStart > 3000) {
+          lastCamStart = millis();
+          Serial.println("CAMERA BOT: Auto-starting Gemini Live session...");
+          startSession();
+        }
       }
     }
   }
