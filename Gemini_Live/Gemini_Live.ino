@@ -3,6 +3,7 @@
 #include <HWCDC.h>
 #include "esp_sleep.h"
 #include "driver/gpio.h"
+#include "esp_netif.h"
 #include <math.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -36,6 +37,7 @@
 bool hasCamera = false;
 bool hasScreen = true;
 uint32_t lastCameraFrame = 0;
+constexpr uint32_t CAMERA_FRAME_INTERVAL_MS = 3000;
 
 #include "driver/i2c_master.h"
 
@@ -677,7 +679,7 @@ void sendCameraFrame() {
   free(b64_buf);
 
   ws.sendTXT(payload);
-  Serial.printf("CAMERA: Ingested 1FPS frame (%u bytes JPEG)\n", (unsigned int)send_len);
+  Serial.printf("CAMERA: Ingested frame (%u bytes JPEG)\n", (unsigned int)send_len);
 }
 
 #include <WebServer.h>
@@ -901,7 +903,8 @@ void connectWifi() {
   WiFi.setSleep(false);
   WiFi.begin((selectedHotspot?backupSsid:ssid).c_str(),(selectedHotspot?backupPassword:password).c_str());
   wifiAttempt=millis();status(selectedHotspot?"Connecting hotspot":"Connecting home Wi-Fi");
-  configTime(0,0,"time.google.com","pool.ntp.org");
+  // First server is time.google.com's anycast IP so the clock can sync even if DNS is broken.
+  configTime(0,0,"216.239.35.0","time.google.com","pool.ntp.org");
 }
 void selectOtherWifi() {
   if(wanted){stopSession("Stopped. Hold BOOT to switch Wi-Fi");return;}
@@ -973,6 +976,33 @@ void readSetup() {
     else serialLine="";
   }
 }
+// Fallback clock sync when NTP (UDP) is blocked: HTTP HEAD to dns.google by IP over TCP
+// (no DNS needed) and parse the Date header. Returns 1=time set, 0=TCP ok but no date,
+// -1=no TCP connectivity at all.
+int syncTimeFromHttpDate() {
+  NetworkClient c;
+  if (!c.connect(IPAddress(8, 8, 8, 8), 80, 4000)) return -1;
+  c.print("HEAD / HTTP/1.1\r\nHost: dns.google\r\nConnection: close\r\n\r\n");
+  uint32_t start = millis();
+  while (millis() - start < 4000) {
+    if (!c.available()) { if (!c.connected()) break; delay(10); continue; }
+    String line = c.readStringUntil('\n');
+    if (line.length() <= 1) break;  // end of headers
+    if (line.startsWith("Date:") || line.startsWith("date:")) {
+      struct tm tm = {};
+      if (strptime(line.c_str() + 6, "%a, %d %b %Y %H:%M:%S", &tm)) {
+        setenv("TZ", "UTC0", 1); tzset();
+        struct timeval tv = { mktime(&tm), 0 };
+        settimeofday(&tv, nullptr);
+        c.stop();
+        return 1;
+      }
+    }
+  }
+  c.stop();
+  return 0;
+}
+
 void setup() {
   Serial.begin(115200);
 #ifdef USING_M5STACK
@@ -1023,6 +1053,22 @@ void setup() {
   Serial.begin(115200);delay(1500);pinMode(0,INPUT_PULLUP);pinMode(18,INPUT_PULLUP);
 #endif
   WiFi.onEvent([](WiFiEvent_t,WiFiEventInfo_t info){wifiFailureReason=info.wifi_sta_disconnected.reason;},ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  // On DHCP lease: log network info and add public DNS as backup/fallback so a broken or
+  // filtered DHCP-provided resolver doesn't block NTP and the Gemini WebSocket.
+  // esp_netif_* calls are thread-safe (marshalled to the lwIP task).
+  WiFi.onEvent([](WiFiEvent_t,WiFiEventInfo_t){
+    esp_netif_t *nif=esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if(!nif)return;
+    esp_netif_dns_info_t mainDns={};
+    esp_netif_get_dns_info(nif,ESP_NETIF_DNS_MAIN,&mainDns);
+    Serial.printf("NET: ip=%s gw=%s dhcp_dns=" IPSTR "\n",WiFi.localIP().toString().c_str(),
+                  WiFi.gatewayIP().toString().c_str(),IP2STR(&mainDns.ip.u_addr.ip4));
+    esp_netif_dns_info_t d={};d.ip.type=ESP_IPADDR_TYPE_V4;
+    d.ip.u_addr.ip4.addr=ESP_IP4TOADDR(8,8,8,8);
+    esp_netif_set_dns_info(nif,mainDns.ip.u_addr.ip4.addr==0?ESP_NETIF_DNS_MAIN:ESP_NETIF_DNS_BACKUP,&d);
+    d.ip.u_addr.ip4.addr=ESP_IP4TOADDR(1,1,1,1);
+    esp_netif_set_dns_info(nif,ESP_NETIF_DNS_FALLBACK,&d);
+  },ARDUINO_EVENT_WIFI_STA_GOT_IP);
 #ifdef USING_M5STACK
   prefs.begin("gemini",false);
   volume=constrain((int)prefs.getUChar("volume",85),0,100);
@@ -1061,7 +1107,10 @@ void setup() {
       Serial.printf("AEC INIT: frame=%d mode=%d ready=%d\n",option[0],option[1],echoCanceller!=nullptr);
       if(echoCanceller){aecFrameSamples=option[0]*16;aecMode=option[1];break;}
     }
-    micQueue=xQueueCreate(4,sizeof(MicFrame));
+    // ~1 s of 32 ms frames so network stalls (e.g. camera uploads) don't drop speech.
+    // Backed by PSRAM to keep internal RAM free for TLS/Wi-Fi.
+    micQueue=xQueueCreateWithCaps(32,sizeof(MicFrame),MALLOC_CAP_SPIRAM);
+    if(!micQueue)micQueue=xQueueCreate(8,sizeof(MicFrame));
     Serial.printf("AUDIO INIT: speaker=%d mic=%d AEC=%d queue=%d free RAM=%u\n",speakerResult,micResult,echoCanceller!=nullptr,micQueue!=nullptr,ESP.getFreeHeap());
     audioReady=echoCanceller&&micQueue&&toneQueue&&audioRing&&speakerResult==0&&micResult==0;
     if(audioReady){
@@ -1257,18 +1306,37 @@ void loop() {
         }
       }
       // AtomS3R CAM: auto-start session once Wi-Fi connects and NTP time is valid
-      if (cameraInitialized && configured && !wanted && !live && time(nullptr) > 1700000000) {
-        static uint32_t lastCamStart = 0;
-        if (millis() - lastCamStart > 3000) {
-          lastCamStart = millis();
-          Serial.println("CAMERA BOT: Auto-starting Gemini Live session...");
-          startSession();
+      // (TLS to Gemini needs a valid clock).
+      if (configured && !wanted && !live) {
+        if (time(nullptr) > 1700000000) {
+          static uint32_t lastCamStart = 0;
+          if (millis() - lastCamStart > 3000) {
+            lastCamStart = millis();
+            Serial.println("CAMERA BOT: Auto-starting Gemini Live session...");
+            startSession();
+          }
+        } else {
+          static uint32_t lastNtpKick = 0;
+          if (millis() - lastNtpKick > 15000) {
+            lastNtpKick = millis();
+            // Don't probe DNS with WiFi.hostByName() here: in Arduino-ESP32 3.3.0 it calls
+            // dns_clear_cache() without the TCPIP lock, which fires SNTP's pending DNS
+            // callback -> udp_new() unlocked -> lwIP assert. Also don't re-call configTime().
+            Serial.println("CAMERA BOT: Waiting for NTP time sync...");
+            // NTP may be blocked (UDP). Try the TCP/HTTP Date fallback.
+            int r = syncTimeFromHttpDate();
+            if (r == 1) Serial.printf("CAMERA BOT: Clock set from HTTP Date (epoch=%ld)\n", (long)time(nullptr));
+            else if (r == 0) Serial.println("CAMERA BOT: Internet reachable over TCP but no Date header");
+            else Serial.println("CAMERA BOT: No internet: cannot reach 8.8.8.8:80. Wi-Fi network has no working uplink.");
+          }
         }
       }
     }
   }
 
-  if (hasCamera && live && millis() - lastCameraFrame >= 1000) {
+  // One frame every 3 s. Audio has priority: only upload when the mic backlog is small.
+  if (hasCamera && live && millis() - lastCameraFrame >= CAMERA_FRAME_INTERVAL_MS &&
+      (!audioReady || uxQueueMessagesWaiting(micQueue) <= 1)) {
     lastCameraFrame = millis();
     sendCameraFrame();
   }
@@ -1281,10 +1349,13 @@ void loop() {
     if(WiFi.status()==WL_CONNECTED&&(lastScreen=="Connecting home Wi-Fi"||lastScreen=="Connecting hotspot"))status(selectedHotspot?"Hotspot ready. BOOT":"Home Wi-Fi ready. BOOT");
     else if(WiFi.status()!=WL_CONNECTED&&millis()-wifiAttempt>30000){status(selectedHotspot?"Hotspot failed. Hold BOOT for home":"Home Wi-Fi failed. Check setup");WiFi.reconnect();wifiAttempt=millis();}
   }
+  // Drain every pending mic frame (not just one per loop) so backlog never builds up.
   MicFrame frame;
-  if(audioReady&&xQueueReceive(micQueue,&frame,0)==pdTRUE&&live) {
+  while(audioReady&&xQueueReceive(micQueue,&frame,0)==pdTRUE) {
+    if(!live)continue;
     char encoded[1372];size_t out=0;
-    mbedtls_base64_encode((uint8_t*)encoded,sizeof(encoded)-1,&out,(uint8_t*)frame.samples,sizeof(frame.samples));encoded[out]=0;
+    if(mbedtls_base64_encode((uint8_t*)encoded,sizeof(encoded),&out,(uint8_t*)frame.samples,sizeof(frame.samples))!=0)continue;
+    encoded[out]=0;
     JsonDocument doc;doc["realtimeInput"]["audio"]["mimeType"]="audio/pcm;rate=16000";
     doc["realtimeInput"]["audio"]["data"]=encoded;sendJson(doc);
   }
