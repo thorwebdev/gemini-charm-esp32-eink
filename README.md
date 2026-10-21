@@ -50,6 +50,11 @@ Tail live runtime logs and debug output from the device at any time with:
 arduino-cli monitor -p PORT -c baudrate=115200
 ```
 
+> [!NOTE]
+> **About `baudrate=115200`:** the baud rate is the speed of a serial link in symbols (here, bits) per second. 115200 baud is roughly 11.5 KB/s of text, since each byte also needs a start and a stop bit. On a classic UART link (TX/RX pins or a USB-to-serial chip), both sides must use the same rate or the output turns into garbage like `⸮⸮x⸮⸮`. That is why the firmware calls `Serial.begin(115200)`.
+>
+> These boards are built with `CDCOnBoot=cdc`, so `Serial` runs over the ESP32-S3's **native USB** instead of a UART. Native USB runs at full USB speed and ignores the baud setting, so any value works. 115200 is used by convention, and it keeps the command correct for UART-based boards.
+
 This device firmware supports the original Waveshare ESP32-S3 e-Paper board, the M5Stack AtomS3R AI Chatbot Kit (display edition), and the M5Stack AtomS3R CAM AI Chatbot Kit (multimodal camera edition with 1 FPS live video streaming). Hermes is an optional backend placeholder. You can replace it with any agent through a compatible API or adapter; see [agent backend interface](docs/AGENT_BACKEND.md). The backend is a separate service and is not included. Included vendor sources retain their original licenses. No new license is granted for the application code.
 
 The saved v3.2 checkpoint reports successful compilation, flash verification, direct-answer and Hermes-delegation tests. Microphone recognition was not verified in that checkpoint. This export makes the original personal Hermes URL configurable; the rest of the saved firmware is preserved. No hardware is flashed during export.

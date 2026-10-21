@@ -122,6 +122,8 @@ bool initCamera() {
   if (s && s->get_reg) {
     pid = s->get_reg(s, 0x00, 0xff);
   }
+  // GC0308 output is horizontally mirrored on the AtomS3R-CAM; flip so text reads correctly.
+  if (s && s->set_hmirror) s->set_hmirror(s, 1);
   Serial.printf("CAMERA: GC0308 initialized at 320x240 (QVGA) - PID=0x%02x\n", pid);
   return true;
 }
@@ -156,6 +158,8 @@ bool lastPowerButton=HIGH,stablePowerButton=HIGH,powerLongHandled=false;
 uint32_t powerChanged=0,powerPressed=0;
 String lastScreen;
 std::atomic<bool> hermesNotification{false};
+// Temporary diagnostics: worst-case timings per 1 s window, printed as PERF while a session is active.
+volatile uint32_t perfSendMax=0,perfWsLoopMax=0,perfLoopMax=0,perfRxMsgs=0,perfRxAudioBytes=0,perfTxBytes=0,perfUnderruns=0,perfMicDropped=0;
 int batteryPercent=-1;
 float batteryVoltage=0;
 uint32_t lastBatterySample=0;
@@ -547,10 +551,16 @@ void audioTask(void*) {
     // Drop stale input rather than delay conversation behind network stalls.
     if(xQueueSend(micQueue,&frame,0)!=pdTRUE){MicFrame dropped;xQueueReceive(micQueue,&dropped,0);xQueueSend(micQueue,&frame,0);}
     xSemaphoreTake(audioMutex,portMAX_DELAY);
-    bool audible=audioUsed>=6;
+    // Jitter buffer: after an underrun, wait for ~250 ms of 24 kHz PCM (or the end of the
+    // turn) before resuming, so network gaps don't become audible stutter.
+    constexpr size_t PREBUFFER_BYTES=24000*2/4;
+    static bool primed=false;
+    if(audioUsed<6){if(primed)perfUnderruns++;primed=false;}
+    else if(!primed&&(audioUsed>=PREBUFFER_BYTES||!generating))primed=true;
+    bool audible=primed;
     for(int pair=0;pair<256;pair++) {
       int16_t input[3]={};
-      if(audioUsed>=6){for(int k=0;k<3;k++){
+      if(audible&&audioUsed>=6){for(int k=0;k<3;k++){
         uint8_t lo=audioRing[readPos];readPos=(readPos+1)%AUDIO_CAP;
         uint8_t hi=audioRing[readPos];readPos=(readPos+1)%AUDIO_CAP;
         input[k]=(int16_t)((uint16_t)lo|((uint16_t)hi<<8));
@@ -582,7 +592,11 @@ void audioTask(void*) {
 void stopSession(const String &message) {
   lastActivity=millis();wanted=live=generating=false;ws.disconnect();clearAudio();status(message);
 }
-void sendJson(JsonDocument &doc) {String data;serializeJson(doc,data);ws.sendTXT(data);}
+void sendJson(JsonDocument &doc) {
+  String data;serializeJson(doc,data);
+  uint32_t t=millis();ws.sendTXT(data);t=millis()-t;
+  if(t>perfSendMax)perfSendMax=t;perfTxBytes+=data.length();
+}
 
 #ifdef USING_M5STACK
 static uint8_t *latestJpegBuf = nullptr;
@@ -678,8 +692,12 @@ void sendCameraFrame() {
   payload += "\"}}}";
   free(b64_buf);
 
+  uint32_t sendStart = millis();
   ws.sendTXT(payload);
-  Serial.printf("CAMERA: Ingested frame (%u bytes JPEG)\n", (unsigned int)send_len);
+  uint32_t sendMs = millis() - sendStart;
+  if (sendMs > perfSendMax) perfSendMax = sendMs;
+  perfTxBytes += payload.length();
+  Serial.printf("CAMERA: Ingested frame (%u bytes JPEG, send %u ms)\n", (unsigned int)send_len, (unsigned int)sendMs);
 }
 
 #include <WebServer.h>
@@ -808,6 +826,7 @@ void startCameraWebServer() {
 #include "hermes_bridge.h"
 
 void serverMessage(const uint8_t *data,size_t len) {
+  perfRxMsgs++;
   JsonDocument doc;
   if(deserializeJson(doc,data,len)){stopSession("Response error");return;}
   if(doc["error"].is<JsonObject>()){
@@ -823,6 +842,7 @@ void serverMessage(const uint8_t *data,size_t len) {
     greeting["clientContent"]["turns"][0]["parts"][0]["text"]="Say: \"Hey, I'm Gemini, how can I help you?\"";
     greeting["clientContent"]["turnComplete"]=true;
     sendJson(greeting);
+    generating=true; // reply audio is imminent; hold camera uploads until turnComplete
     Serial.println("GREETING_SENT: 'Hey, I'm Gemini, how can I help you?'");
     return;
   }
@@ -839,8 +859,10 @@ void serverMessage(const uint8_t *data,size_t len) {
       size_t encodedLen=strlen(encoded),cap=encodedLen/4*3+4,out=0;
       uint8_t *pcm=(uint8_t*)ps_malloc(cap);
       if(!pcm){stopSession("Audio memory error");return;}
+      generating=true; // set before enqueue so the jitter buffer waits for more audio
       int result=mbedtls_base64_decode(pcm,cap,&out,(const uint8_t*)encoded,encodedLen);
       bool ok=result==0 && enqueueAudio(pcm,out);
+      perfRxAudioBytes+=out;
       free(pcm);
       if(!ok){stopSession("Audio buffer full");return;}
       generating=true;status("Speaking");
@@ -878,6 +900,8 @@ void socketEvent(WStype_t type,uint8_t *data,size_t len) {
       fragments.concat((const char*)data,len);
       if(type==WStype_FRAGMENT_FIN){serverMessage((const uint8_t*)fragments.c_str(),fragments.length());fragments="";}break;
     case WStype_DISCONNECTED:
+      Serial.printf("WS_DISCONNECTED: live=%d reason='%.*s' free_int=%u wifi=%d rssi=%d playing=%d vol=%d\n",live,(int)len,data?(const char*)data:"",
+                    heap_caps_get_free_size(MALLOC_CAP_INTERNAL),(int)WiFi.status(),WiFi.RSSI(),(int)playing,(int)volume);
       live=generating=false;clearAudio();
       if(wanted){wanted=false;status("Disconnected. Click BOOT");}break;
     case WStype_ERROR:stopSession("Connection error");break;
@@ -1128,6 +1152,8 @@ void setup() {
   if(configured)connectWifi();else status("Enter setup on Mac");
   lastActivity=millis();
   Serial.println("GEMINI_FIRMWARE_READY: hermes-notification-v2-auto-hermes-v1 idle=120s mic_gain=18 speech_start=LOW wake=BOOT");
+  // 1=power-on 3=software 4=panic 5=int_wdt 6=task_wdt 7=wdt 9=BROWNOUT
+  Serial.printf("RESET_REASON: %d\n",(int)esp_reset_reason());
 }
 // Workers acknowledge only between complete audio/network operations.
 // RAM and task state are retained; the wake press is consumed before normal BOOT handling.
@@ -1334,30 +1360,47 @@ void loop() {
     }
   }
 
-  // One frame every 3 s. Audio has priority: only upload when the mic backlog is small.
-  if (hasCamera && live && millis() - lastCameraFrame >= CAMERA_FRAME_INTERVAL_MS &&
+  // One frame every 3 s. Audio has priority: only upload when the mic backlog is small,
+  // and never while Gemini is streaming a reply. ws.sendTXT() blocks until the whole
+  // ~15 KB frame is written without reading the socket; colliding with the inbound
+  // audio burst stalls the TLS stream (loop hang, or mid-frame timeout -> disconnect).
+  if (hasCamera && live && !generating && !playing &&
+      millis() - lastCameraFrame >= CAMERA_FRAME_INTERVAL_MS &&
       (!audioReady || uxQueueMessagesWaiting(micQueue) <= 1)) {
     lastCameraFrame = millis();
     sendCameraFrame();
   }
 #endif
 
-  if(wanted)ws.loop();
+  if(wanted){uint32_t t=millis();ws.loop();t=millis()-t;if(t>perfWsLoopMax)perfWsLoopMax=t;}
   if(wanted&&!live&&millis()-connectStarted>20000)stopSession("Connection timeout");
   if(live&&millis()-sessionStarted>5*60*1000)stopSession("5 min ended. Click BOOT");
   if(configured&&!wanted) {
     if(WiFi.status()==WL_CONNECTED&&(lastScreen=="Connecting home Wi-Fi"||lastScreen=="Connecting hotspot"))status(selectedHotspot?"Hotspot ready. BOOT":"Home Wi-Fi ready. BOOT");
     else if(WiFi.status()!=WL_CONNECTED&&millis()-wifiAttempt>30000){status(selectedHotspot?"Hotspot failed. Hold BOOT for home":"Home Wi-Fi failed. Check setup");WiFi.reconnect();wifiAttempt=millis();}
   }
-  // Drain every pending mic frame (not just one per loop) so backlog never builds up.
-  MicFrame frame;
-  while(audioReady&&xQueueReceive(micQueue,&frame,0)==pdTRUE) {
-    if(!live)continue;
-    char encoded[1372];size_t out=0;
-    if(mbedtls_base64_encode((uint8_t*)encoded,sizeof(encoded),&out,(uint8_t*)frame.samples,sizeof(frame.samples))!=0)continue;
-    encoded[out]=0;
-    JsonDocument doc;doc["realtimeInput"]["audio"]["mimeType"]="audio/pcm;rate=16000";
-    doc["realtimeInput"]["audio"]["data"]=encoded;sendJson(doc);
+  // Upload mic audio in ~96 ms chunks, at most one message per loop pass, so ws.loop()
+  // keeps reading Gemini's reply. The old "drain everything" loop never exited once each
+  // send took longer than a 32 ms frame (slow uplink), starving playback for seconds.
+  // If the uplink falls behind, drop the oldest audio instead of accumulating latency.
+  if(audioReady) {
+    constexpr int MIC_FRAMES_PER_MSG=3, MIC_MAX_BACKLOG=8; // 96 ms per message, <=256 ms queued
+    MicFrame frame;
+    if(!live){while(xQueueReceive(micQueue,&frame,0)==pdTRUE){}}
+    else {
+      while(uxQueueMessagesWaiting(micQueue)>MIC_MAX_BACKLOG&&xQueueReceive(micQueue,&frame,0)==pdTRUE)perfMicDropped++;
+      if(uxQueueMessagesWaiting(micQueue)>=MIC_FRAMES_PER_MSG) {
+        static int16_t chunk[512*MIC_FRAMES_PER_MSG];
+        static char encoded[(sizeof(chunk)+2)/3*4+1];
+        for(int i=0;i<MIC_FRAMES_PER_MSG;i++){xQueueReceive(micQueue,&frame,0);memcpy(chunk+512*i,frame.samples,sizeof(frame.samples));}
+        size_t out=0;
+        if(mbedtls_base64_encode((uint8_t*)encoded,sizeof(encoded),&out,(uint8_t*)chunk,sizeof(chunk))==0) {
+          encoded[out]=0;
+          JsonDocument doc;doc["realtimeInput"]["audio"]["mimeType"]="audio/pcm;rate=16000";
+          doc["realtimeInput"]["audio"]["data"]=(const char*)encoded;sendJson(doc);
+        }
+      }
+    }
   }
   if(live&&!generating&&!playing&&lastScreen=="Speaking")status("Listening");
   if(wanted||hermesPending||playing||wifiDiagnosticScan||!configured||WiFi.status()!=WL_CONNECTED)lastActivity=millis();
@@ -1368,5 +1411,17 @@ void loop() {
   if(!wanted&&!hermesPending&&!playing&&!wifiDiagnosticScan&&configured&&WiFi.status()==WL_CONNECTED&&
      digitalRead(0)==HIGH&&digitalRead(18)==HIGH&&millis()-lastActivity>=IDLE_SLEEP_MS)enterIdleSleep();
 #endif
+  {
+    static uint32_t lastLoopStart=0,lastPerf=0;
+    uint32_t now=millis();
+    if(lastLoopStart&&now-lastLoopStart>perfLoopMax)perfLoopMax=now-lastLoopStart;
+    lastLoopStart=now;
+    if(now-lastPerf>=1000){
+      if(wanted)Serial.printf("PERF: win=%ums loop_max=%ums ws_loop_max=%ums send_max=%ums rx_msgs=%u rx_audio=%uB tx=%uB ring=%uB underruns=%u mic_drop=%u micq=%u gen=%d play=%d\n",
+        now-lastPerf,perfLoopMax,perfWsLoopMax,perfSendMax,perfRxMsgs,perfRxAudioBytes,perfTxBytes,(unsigned)audioUsed,perfUnderruns,perfMicDropped,
+        audioReady?(unsigned)uxQueueMessagesWaiting(micQueue):0,(int)generating,(int)playing);
+      perfLoopMax=perfWsLoopMax=perfSendMax=perfRxMsgs=perfRxAudioBytes=perfTxBytes=perfUnderruns=perfMicDropped=0;lastPerf=now;
+    }
+  }
   delay(1);
 }

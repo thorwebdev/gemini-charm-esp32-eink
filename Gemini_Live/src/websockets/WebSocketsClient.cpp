@@ -625,7 +625,7 @@ bool WebSocketsClient::clientIsConnected(WSclient_t * client) {
     } else {
         // client lost
         if(client->status != WSC_NOT_CONNECTED) {
-            DEBUG_WEBSOCKETS("[WS-Client] connection lost.\n");
+            Serial.printf("WSDBG [WS-Client] connection lost (tcp closed by peer or reset).\n");
             // do cleanup
             clientDisconnect(client, "Connection lost");
         }

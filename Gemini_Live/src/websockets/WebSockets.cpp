@@ -67,7 +67,7 @@ extern "C" {
  * @param reasonLen length of the disconnect reason message
  */
 void WebSockets::clientDisconnect(WSclient_t * client, uint16_t code, char * reason, size_t reasonLen) {
-    DEBUG_WEBSOCKETS("[WS][%d][handleWebsocket] clientDisconnect code: %u\n", client->num, code);
+    Serial.printf("WSDBG [WS][%d] clientDisconnect code: %u\n", client->num, code);
     if(client->status == WSC_CONNECTED && code) {
         if(reason) {
             sendFrame(client, WSop_close, (uint8_t *)reason, reasonLen);
@@ -436,7 +436,7 @@ void WebSockets::handleWebsocketCb(WSclient_t * client) {
     DEBUG_WEBSOCKETS("[WS][%d][handleWebsocket] mask: %u payloadLen: %u\n", client->num, header->mask, header->payloadLen);
 
     if(header->payloadLen > WEBSOCKETS_MAX_DATA_SIZE) {
-        DEBUG_WEBSOCKETS("[WS][%d][handleWebsocket] payload too big! (%u)\n", client->num, header->payloadLen);
+        Serial.printf("WSDBG [WS][%d] payload too big! (%u)\n", client->num, header->payloadLen);
         clientDisconnect(client, 1009);
         return;
     }
@@ -620,7 +620,7 @@ bool WebSockets::readCb(WSclient_t * client, uint8_t * out, size_t n, WSreadWait
         }
 
         if(!client->tcp->connected()) {
-            DEBUG_WEBSOCKETS("[readCb] not connected!\n");
+            Serial.printf("WSDBG [readCb] not connected!\n");
             if(cb) {
                 cb(client, false);
             }
@@ -628,7 +628,7 @@ bool WebSockets::readCb(WSclient_t * client, uint8_t * out, size_t n, WSreadWait
         }
 
         if((millis() - t) > WEBSOCKETS_TCP_TIMEOUT) {
-            DEBUG_WEBSOCKETS("[readCb] receive TIMEOUT! %lu\n", (millis() - t));
+            Serial.printf("WSDBG [readCb] receive TIMEOUT! %lu\n", (millis() - t));
             if(cb) {
                 cb(client, false);
             }
@@ -684,12 +684,12 @@ size_t WebSockets::write(WSclient_t * client, uint8_t * out, size_t n) {
         }
 
         if(!client->tcp->connected()) {
-            DEBUG_WEBSOCKETS("[write] not connected!\n");
+            Serial.printf("WSDBG [write] not connected!\n");
             break;
         }
 
         if((millis() - t) > WEBSOCKETS_TCP_TIMEOUT) {
-            DEBUG_WEBSOCKETS("[write] write TIMEOUT! %lu\n", (millis() - t));
+            Serial.printf("WSDBG [write] write TIMEOUT! %lu\n", (millis() - t));
             break;
         }
 
