@@ -10,20 +10,13 @@ import serial
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port', required=True)
-    parser.add_argument('--mode', choices=['gemini', 'hermes', 'backup-wifi'], default='gemini')
+    parser.add_argument('--mode', choices=['gemini', 'backup-wifi'], default='gemini')
     args = parser.parse_args()
     if args.mode == 'gemini':
         payload = {'command': 'configure', 'ssid': input('Wi-Fi name: '),
                    'password': getpass.getpass('Wi-Fi password: '),
-                   'key': getpass.getpass('Gemini API key: '),
-                   'model': input('Live model [gemini-3.8-live]: ') or 'gemini-3.8-live'}
+                   'key': getpass.getpass('Gemini API key: ')}
         expected = 'CONFIG_SAVED'
-    elif args.mode == 'hermes':
-        payload = {'command': 'configure_hermes',
-                   'cf_id': getpass.getpass('Cloudflare client ID: '),
-                   'cf_secret': getpass.getpass('Cloudflare client secret: '),
-                   'hermes_key': getpass.getpass('Hermes API key: ')}
-        expected = 'HERMES_CONFIG_SAVED'
     else:
         payload = {'command': 'configure_backup_wifi', 'ssid': input('Backup Wi-Fi name: '),
                    'password': getpass.getpass('Backup Wi-Fi password: ')}
