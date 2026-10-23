@@ -171,8 +171,12 @@ String routerInstruction() {
     "high-contrast black-and-white illustration with a simple, centered composition, thick lines and minimal fine detail.\n"
     "- song: the user wants music, a song, melody, jingle or tune. prompt = a music prompt keeping the requested genre, mood, "
     "instruments, language and any lyrics the user dictated.\n"
-    "- voice: the user wants to create, design or change to a new voice persona. prompt = a concise 1-2 sentence description of "
-    "permanent vocal traits (age, timbre, accent, baseline delivery). Also set voice_name (max 24 characters), gender and a BCP-47 language_code.\n"
+    "- voice: the user wants to create, design or change to a new voice persona. prompt = the user's own voice description, "
+    "kept as close to their words as possible: you may only drop filler like 'design the voice of'. NEVER remove, generalize or "
+    "translate the spoken language, dialect, regional origin or accent (e.g. keep 'speaking Taiwanese Mandarin' or 'Sligo Irish "
+    "accent' word for word), and keep age, gender, emotion and delivery. If the language is implied by the origin, state it "
+    "explicitly (e.g. 'speaking Taiwanese Mandarin'). Also set voice_name (max 24 characters), gender, and language_code = the "
+    "BCP-47 code of the language the voice should SPEAK, with region (e.g. zh-TW, en-IE, ja-JP), not the transcript language.\n"
     "- voice_reset: the user wants the normal or default voice back. prompt = a short spoken confirmation in the user's language.\n"
     "- speech: anything else (questions, chat, requests). prompt = your spoken reply: helpful, natural, 1-3 short sentences, "
     "in the user's language, no markdown or lists. style = a short delivery style such as 'warm and upbeat'.\n"
@@ -403,6 +407,8 @@ void runGeneration(const String &prompt) {
   Route route;
   if(!routePrompt(prompt,route)){failOrCancel("Router failed. Try again");return;}
   Serial.printf("ROUTER: action=%s prompt=%s\n",route.action.c_str(),route.prompt.c_str());
+  if(route.action=="voice")Serial.printf("ROUTER: voice name=%s gender=%s language=%s\n",route.voiceName.c_str(),
+                                         route.gender.c_str(),route.language.c_str());
   if(genCancel){genCancelled();return;}
   if(route.action=="image")doImage(route);
   else if(route.action=="song")doSong(route);
