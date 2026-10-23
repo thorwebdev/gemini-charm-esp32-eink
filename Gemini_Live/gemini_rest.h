@@ -102,7 +102,10 @@ int readHttpBody(HTTPClient &http,const BodySink &sink,size_t &total,uint32_t id
     if(chunked)want=min(want,chunkLeft);
     if(remaining>0)want=min(want,(size_t)remaining);
     int n=stream->read(buf,want);
-    if(n<=0){delay(1);continue;}
+    if(n<=0){
+      if(millis()-lastData>idleMs)return -107;
+      delay(1);continue;
+    }
     lastData=millis();total+=n;
     if(chunked)chunkLeft-=n;
     if(remaining>0)remaining-=n;
@@ -179,6 +182,39 @@ bool base64ToPs(const char *encoded,PsBuffer &out) {
   if(!out.reserve(n/4*3+4))return false;
   if(mbedtls_base64_decode(out.data,out.cap,&olen,(const uint8_t*)encoded,n)!=0){out.release();return false;}
   out.len=olen;return true;
+}
+
+// Finds the string value of `"data"` after `"<parentKey>"` in a raw JSON body and decodes it
+// in place (output never overtakes input), then moves the storage into `out`. `rest` receives
+// the JSON with that value emptied (small, safe to parse). Avoids holding multi-MB base64
+// twice in PSRAM, which made a full deserializeJson of a voice preview run out of memory.
+bool takeBase64Field(PsBuffer &raw,const char *parentKey,PsBuffer &out,String &rest) {
+  out.release();rest="";
+  if(!raw.data||!raw.len)return false;
+  String parent=String("\"")+parentKey+"\"";
+  char *p=strstr((char*)raw.data,parent.c_str());
+  if(!p||!(p=strstr(p,"\"data\"")))return false;
+  p+=6;
+  while(*p==' '||*p=='\n'||*p=='\r'||*p=='\t')p++;
+  if(*p++!=':')return false;
+  while(*p==' '||*p=='\n'||*p=='\r'||*p=='\t')p++;
+  if(*p++!='"')return false;
+  char *end=strchr(p,'"');
+  if(!end)return false;
+  rest.reserve((p-(char*)raw.data)+strlen(end)+1);
+  rest.concat((const char*)raw.data,p-(char*)raw.data);
+  rest.concat(end);
+  uint8_t *dst=raw.data;uint32_t acc=0;int bits=0;size_t w=0;
+  for(const uint8_t *s=(const uint8_t*)p;s<(const uint8_t*)end;s++){
+    uint8_t c=*s;
+    int v=c>='A'&&c<='Z'?c-'A':c>='a'&&c<='z'?c-'a'+26:c>='0'&&c<='9'?c-'0'+52:c=='+'||c=='-'?62:c=='/'||c=='_'?63:-1;
+    if(v<0)continue; // Padding, whitespace, JSON escape backslashes.
+    acc=(acc<<6)|v;bits+=6;
+    if(bits>=8){bits-=8;dst[w++]=(uint8_t)(acc>>bits);}
+  }
+  if(!w)return false;
+  raw.len=w;out.take(raw);
+  return true;
 }
 
 // ---------- Streaming (server-sent events) ----------
@@ -284,7 +320,10 @@ int geminiStream(const String &path,const String &body,SseHandler handler,uint32
   http.addHeader("Accept","text/event-stream");
   http.addHeader("Content-Type","application/json");
   const char *keys[]={"Transfer-Encoding"};http.collectHeaders(keys,1);
+  uint32_t t0=millis();
+  Serial.printf("GEMINI_SSE: connecting (heap=%u)\n",ESP.getFreeHeap());
   int code=http.POST(body);
+  Serial.printf("GEMINI_SSE: headers -> %d after %lu ms\n",code,(unsigned long)(millis()-t0));
   if(code!=200){
     PsBuffer err;
     if(code>0)readHttpBodyTo(http,err,65536,15000);

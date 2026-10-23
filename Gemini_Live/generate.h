@@ -337,13 +337,43 @@ void doVoiceDesign(const Route &route) {
   String body;serializeJson(req,body);
   PsBuffer sample;String id,mime;
   {
+    PsBuffer raw;
+    int code=geminiHttp("POST","/v1beta/voices",&body,raw);
+    if(code!=200){logApiError(raw);failOrCancel("Voice design failed");return;}
+    // The base64 WAV preview is MBs: decode it in place and parse only the rest.
+    String rest;
+    if(!takeBase64Field(raw,"sample_audio",sample,rest)){
+      Serial.println("VOICE: no sample_audio in response");
+      rest=String((const char*)raw.data);
+    }
+    raw.release();
     JsonDocument res(&psramJson);
-    if(geminiJson("POST","/v1beta/voices",&body,res)!=200){failOrCancel("Voice design failed");return;}
-    id=res["id"] | "";
-    if(id.isEmpty()){String full=res["name"] | "";id=full.substring(full.lastIndexOf('/')+1);}
-    name=res["display_name"] | name.c_str();
-    mime=res["sample_audio"]["mime_type"] | "audio/wav";
-    base64ToPs(res["sample_audio"]["data"],sample);
+    DeserializationError err=deserializeJson(res,rest);
+    if(err){Serial.printf("VOICE: bad JSON (%s, %u bytes)\n",err.c_str(),rest.length());genFail("Voice design failed");return;}
+    // The Voice may be returned directly, wrapped (`voice` / LRO `response`), or as an array.
+    JsonVariant top=res.is<JsonArray>()?res[0].as<JsonVariant>():res.as<JsonVariant>();
+    bool direct=top["id"].is<const char*>()||top["name"].is<const char*>();
+    JsonVariant v=direct?top:top["voice"].is<JsonObject>()?top["voice"].as<JsonVariant>():
+                  top["response"].is<JsonObject>()?top["response"].as<JsonVariant>():top;
+    id=v["id"] | "";
+    if(id.isEmpty())id=v["voice_id"] | "";
+    if(id.isEmpty()){String full=v["name"] | "";id=full.substring(full.lastIndexOf('/')+1);}
+    name=v["display_name"] | name.c_str();
+    mime=v["sample_audio"]["mime_type"] | "audio/wav";
+    Serial.printf("VOICE: response parsed, sample=%u bytes %s\n",(unsigned)sample.len,mime.c_str());
+    if(id.isEmpty()){
+      // Log only the response shape (key names and types), never values.
+      String shape;
+      if(res.is<JsonObject>())for(JsonPair kv:res.as<JsonObject>()){
+        shape+=String(kv.key().c_str())+(kv.value().is<JsonObject>()?"{":kv.value().is<JsonArray>()?"[":"");
+        if(kv.value().is<JsonObject>()){
+          for(JsonPair in:kv.value().as<JsonObject>())shape+=String(in.key().c_str())+",";
+          shape+="}";
+        }
+        shape+=" ";
+      }else shape=res.is<JsonArray>()?"<array>":"<not an object>";
+      Serial.printf("VOICE: no id in response; keys: %s\n",shape.c_str());
+    }
   }
   if(id.isEmpty()){genFail("Voice design failed");return;}
   String oldId=activeVoiceId;
