@@ -4,7 +4,7 @@
 
 Use the original compatible ESP32-S3 board: 8 MB flash, 8 MB OPI PSRAM, ES8311 speaker codec, ES7210 microphone codec and 200×200 e-paper panel. A generic ESP32-S3 without these peripherals needs driver/pin adaptations.
 
-Display pins: CS 11, DC 10, RESET 9, BUSY 8, MOSI 13, clock 12, power control 6. BOOT button: GPIO 0. Audio wiring is defined in the sketch's `setup()` and bundled codec configuration. Check wiring against your actual board before powering it.
+Display pins: CS 11, DC 10, RESET 9, BUSY 8, MOSI 13, clock 12, power control 6. BOOT button: GPIO 0. Side (create) button: GPIO 18. Audio wiring is defined in the sketch's `setup()` and bundled codec configuration. Check wiring against your actual board before powering it.
 
 ### Purchase options
 
@@ -30,7 +30,7 @@ cd gemini-live-agent
 ```sh
 arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
 arduino-cli core install esp32:esp32@3.3.0 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-arduino-cli lib install "ArduinoJson@7.4.3" "Adafruit GFX Library@1.12.6" "Adafruit BusIO@1.17.4"
+arduino-cli lib install "ArduinoJson@7.4.3" "Adafruit GFX Library@1.12.6" "Adafruit BusIO@1.17.4" "JPEGDEC@1.8.4" "ESP8266Audio@2.4.1"
 ```
 
 WebSockets, codec board and ESP codec sources are bundled. Do not install a different WebSockets implementation in place of the bundled code.
@@ -67,4 +67,4 @@ Reference: [Arduino CLI getting started](https://docs.arduino.cc/arduino-cli/get
 
 ## Build validation
 
-The transcription-only source compiles with the versions above. No device behavior is verified by compilation alone.
+The transcribe-and-create source compiles with the versions above. No device behavior is verified by compilation alone.

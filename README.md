@@ -8,6 +8,8 @@ Real-time speech-to-text on a pocket-sized e-paper device using the Gemini Live 
 
 Press BOOT and start talking. While you speak, the display shows the interim transcript as it is recognized. When you pause, server-side voice activity detection finalizes the segment and the display switches to the cleaned-up smart transcript: filler words and false starts removed, self-corrections resolved, punctuation, casing and formatting applied. Press BOOT again to stop.
 
+Then press the side button to turn what you said into something: Gemini Flash-Lite routes the prompt to an image (Nano Banana Lite, dithered for e-paper), spoken audio (Gemini 3.8 Flash-Lite TTS), a 30-second song with lyrics (Lyria 3 Clip), or a newly designed voice that is used for later speech. See [SETUP](docs/SETUP.md#5-create-from-the-transcript).
+
 Language is detected automatically. Includes e-paper display, battery indicator, light sleep and backup Wi-Fi.
 
 During idle light sleep, Wi-Fi and audio turn off; BOOT wakes the device. Battery life has not yet been measured.
