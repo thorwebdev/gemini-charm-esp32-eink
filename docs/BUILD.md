@@ -33,7 +33,7 @@ arduino-cli core install esp32:esp32@3.3.0 --additional-urls https://espressif.g
 arduino-cli lib install "ArduinoJson@7.4.3" "Adafruit GFX Library@1.12.6" "Adafruit BusIO@1.17.4" "JPEGDEC@1.8.4" "ESP8266Audio@2.4.1"
 ```
 
-WebSockets, codec board and ESP codec sources are bundled. Do not install a different WebSockets implementation in place of the bundled code.
+WebSockets, codec board, ESP codec and the QR code generator ([Nayuki qrcodegen](https://github.com/nayuki/QR-Code-generator), MIT) sources are bundled. The setup portal uses `WebServer` and `DNSServer` from the ESP32 core. Do not install a different WebSockets implementation in place of the bundled code.
 
 ## 4. Compile
 

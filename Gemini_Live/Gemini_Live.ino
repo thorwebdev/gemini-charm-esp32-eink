@@ -17,6 +17,7 @@
 #include "epaper_driver_bsp.h"
 #include "google_roots.h"
 #include "screen_msg.h"
+#include "src/qrcodegen/qrcodegen.h"
 
 // Live transcription: stream mic audio to the transcribe model with SMART formatting.
 // Interim hypotheses render while speaking; the cleaned transcript replaces them once
@@ -34,6 +35,9 @@ String backupSsid,backupPassword;
 bool selectedHotspot=false,bootLongHandled=false,wifiRestartPending=false;
 bool netPrimed=false; // DNS primed and SNTP started for the current Wi-Fi connection.
 uint32_t bootPressed=0;
+// Setup mode (setup_portal.h): device hotspot + captive portal, entered on first boot or a 10 s BOOT hold.
+bool setupMode=false;
+bool bootSetupHandled=false,bootLongStopped=false;
 String ssid, password, apiKey, serialLine, fragments;
 esp_codec_dev_handle_t mic, speaker;
 QueueHandle_t screenQueue, micQueue, toneQueue;
@@ -265,6 +269,16 @@ void iconHotspot(GFXcanvas1 &c) {
 void centeredText(GFXcanvas1 &c,const char *text,int y,int size) {
   c.setTextSize(size);c.setCursor(max(4,(200-(int)strlen(text)*6*size)/2),y);c.print(text);
 }
+// Centered QR code at the largest whole-pixel scale that fits `avail` px of height.
+void drawQr(GFXcanvas1 &c,const char *payload,int top,int avail) {
+  static uint8_t qr[qrcodegen_BUFFER_LEN_FOR_VERSION(6)],tmp[qrcodegen_BUFFER_LEN_FOR_VERSION(6)];
+  if(!qrcodegen_encodeText(payload,tmp,qr,qrcodegen_Ecc_MEDIUM,1,6,qrcodegen_Mask_AUTO,true)){
+    centeredText(c,"QR error",top+avail/2,1);return;
+  }
+  int n=qrcodegen_getSize(qr),scale=max(1,avail/n),px=n*scale,x0=(200-px)/2,y0=top+(avail-px)/2;
+  for(int y=0;y<n;y++)for(int x=0;x<n;x++)
+    if(qrcodegen_getModule(qr,x,y))c.fillRect(x0+x*scale,y0+y*scale,scale,scale,0);
+}
 // Word-wraps text and keeps only the last `cap` lines so the newest words stay visible.
 // Returns the total line count, which may exceed `cap`.
 int wrapText(const char *t,int cols,int16_t *starts,uint8_t *lens,int cap) {
@@ -347,8 +361,10 @@ void screenTask(void*) {
       bool connectingHotspot=strstr(text,"Connecting hotspot")||strstr(text,"Switching to hotspot");
       bool connectingWifi=strstr(text,"Connecting home Wi-Fi")||strstr(text,"Switching to home");
       bool connected=!sleeping&&WiFi.status()==WL_CONNECTED&&!connectingHotspot&&!connectingWifi;
-      if(selectedHotspot)iconHotspot(canvas);else iconWifi(canvas);
-      if(!connected)canvas.drawLine(8,30,32,5,0);
+      if(msg.mode!=MODE_QR){
+        if(selectedHotspot)iconHotspot(canvas);else iconWifi(canvas);
+        if(!connected)canvas.drawLine(8,30,32,5,0);
+      }
       canvas.setTextSize(1);
       if(msg.mode==MODE_HOME&&(connectingHotspot||connectingWifi)){
         canvas.setCursor(38,12);canvas.print(connectingHotspot?"Connecting hotspot":"Connecting Wi-Fi");
@@ -364,6 +380,13 @@ void screenTask(void*) {
           iconSpark(canvas);
           centeredText(canvas,msg.caption,146,strlen(msg.caption)*12<=196?2:1);
           statusLines(canvas,msg.text,168);
+          break;
+        case MODE_QR:
+          // Battery stays top-right; the USB label can reach y=33, so the title starts below it.
+          canvas.setTextSize(2);canvas.setCursor(8,8);canvas.print("Setup");
+          centeredText(canvas,msg.caption,35,1);
+          drawQr(canvas,msg.text,46,128);
+          centeredText(canvas,text,177,1);
           break;
         default:
           iconHome(canvas,sleeping);
@@ -495,6 +518,7 @@ void waitPlaybackDone() {
 
 #include "gemini_rest.h"
 #include "generate.h"
+#include "setup_portal.h"
 
 // ---------- Transcription session ----------
 
@@ -533,7 +557,7 @@ void serverMessage(const uint8_t *data,size_t len) {
   if(doc["error"].is<JsonObject>()){
     // Do not print raw server messages, URLs, or credentials.
     Serial.printf("Gemini API error code: %d\n",doc["error"]["code"].as<int>());
-    stopSession("API error. Check key / model");return;
+    stopSession("API error. Check key: hold BOOT 10s");return;
   }
   if(doc["setupComplete"].is<JsonObject>()) {
     live=true;sessionStarted=millis();lastScreen="Listening";Serial.println("STATUS: Listening");
@@ -588,7 +612,7 @@ void socketEvent(WStype_t type,uint8_t *data,size_t len) {
 void startSession() {
   lastActivity=millis();
   if(genBusy)return;
-  if(!configured){status("Enter setup on Mac");return;}
+  if(!configured){status("Hold BOOT 10s for setup");return;}
   if(WiFi.status()!=WL_CONNECTED){status("Wi-Fi unavailable");return;}
   if(!audioReady){status("Audio unavailable");return;}
   if(time(nullptr)<1700000000){status("Waiting for clock");return;}
@@ -651,7 +675,12 @@ void primeNetwork() {
 }
 void selectOtherWifi() {
   if(wanted){stopSession("Stopped. Hold BOOT to switch Wi-Fi");return;}
-  if(backupSsid.isEmpty()){status("Save hotspot on Mac first");return;}
+  if(backupSsid.isEmpty()){
+    // Released after the 3 s hint without a backup saved: put the normal screen back.
+    if(WiFi.status()==WL_CONNECTED)status(selectedHotspot?"Hotspot ready. BOOT":"Home Wi-Fi ready. BOOT");
+    else status("No backup Wi-Fi saved");
+    return;
+  }
   selectedHotspot=!selectedHotspot;prefs.putBool("use_hotspot",selectedHotspot);
   status(selectedHotspot?"Switching to hotspot. Restarting":"Switching to home. Restarting");
   Serial.printf("WIFI SELECTED: %s\n",selectedHotspot?"hotspot":"primary");
@@ -663,6 +692,13 @@ void readSetup() {
     if(c=='\n') {
       JsonDocument doc;auto err=deserializeJson(doc,serialLine);serialLine="";
       if(err)continue;
+      // Wipes Wi-Fi + key so the next boot starts phone setup (backup Wi-Fi and voice are kept).
+      if(doc["command"]=="forget_setup") {
+        prefs.remove("ssid");prefs.remove("password");prefs.remove("key");prefs.putBool("use_hotspot",false);
+        Serial.println("SETUP_FORGOTTEN");Serial.flush();delay(100);ESP.restart();
+      }
+      // While the setup portal runs, only the configuration commands apply.
+      if(setupMode&&doc["command"]!="configure"&&doc["command"]!="configure_backup_wifi")continue;
       if(doc["command"]=="start_session") {lastActivity=millis();if(!wanted)startSession();continue;}
       if(doc["command"]=="stop_session") {if(wanted)endTranscription();continue;}
       if(doc["command"]=="generate") {
@@ -695,7 +731,9 @@ void readSetup() {
       ssid=newSsid;password=doc["password"].as<String>();apiKey=newKey;
       prefs.putString("ssid",ssid);prefs.putString("password",password);prefs.putString("key",apiKey);
       selectedHotspot=false;prefs.putBool("use_hotspot",false);
-      configured=true;Serial.println("CONFIG_SAVED");connectWifi();
+      configured=true;Serial.println("CONFIG_SAVED");
+      if(setupMode){Serial.flush();delay(100);ESP.restart();} // Leave the portal via a clean boot.
+      connectWifi();
     }else if(serialLine.length()<2048)serialLine+=c;
     else serialLine="";
   }
@@ -736,12 +774,12 @@ void setup() {
   backupSsid=prefs.getString("backup_ssid");backupPassword=prefs.getString("backup_password");
   selectedHotspot=prefs.getBool("use_hotspot",false)&&!backupSsid.isEmpty();
   configured=!ssid.isEmpty()&&!apiKey.isEmpty();
-  if(configured)connectWifi();else status("Enter setup on Mac");
+  if(configured)connectWifi();else enterSetupMode();
   lastActivity=millis();
   // PWR is usually still held from powering on: treat it as already handled so its
   // release does not trigger "create" and holding on does not power straight back off.
   lastSide=stableSide=digitalRead(SIDE_BUTTON_PIN);sideChanged=millis();sideLongHandled=stableSide==LOW;
-  Serial.printf("GEMINI_FIRMWARE_READY: transcribe-create-v1 model=%s voice=%s idle=120s mic_gain=18 wake=BOOT power_off=PWR3s\n",
+  Serial.printf("GEMINI_FIRMWARE_READY: transcribe-create-v2 setup=qr model=%s voice=%s idle=120s mic_gain=18 wake=BOOT power_off=PWR3s\n",
                 TRANSCRIBE_MODEL,activeVoiceName.length()?activeVoiceName.c_str():DEFAULT_VOICE);
 }
 // The audio worker acknowledges only between complete I2S blocks.
@@ -778,10 +816,10 @@ void enterIdleSleep() {
   if(!audioReady&&audioPaused){Serial.println("ERROR: restarting to recover audio");ESP.restart();}
   audioHold=false;
   while(digitalRead(0)==LOW)delay(10);
-  lastButton=stableButton=HIGH;buttonChanged=millis();bootLongHandled=false;wifiRestartPending=false;
+  lastButton=stableButton=HIGH;buttonChanged=millis();bootLongHandled=bootSetupHandled=false;wifiRestartPending=false;
   lastSide=stableSide=digitalRead(SIDE_BUTTON_PIN);sideChanged=millis();sideLongHandled=stableSide==LOW;
   lastActivity=millis();lastBatterySample=millis();
-  if(configured)connectWifi();else status("Enter setup on Mac");
+  if(configured)connectWifi();else enterSetupMode();
 }
 
 void onBootShort() {
@@ -845,24 +883,39 @@ void loop() {
   bool button=digitalRead(0);
   if(button!=lastButton){lastActivity=millis();lastButton=button;buttonChanged=millis();}
   if(button!=stableButton&&millis()-buttonChanged>40){stableButton=button;
-    if(button==LOW){bootPressed=millis();bootLongHandled=false;}
-    else if(bootLongHandled&&wifiRestartPending){delay(100);ESP.restart();}
-    else if(!bootLongHandled)onBootShort();
+    if(button==LOW){bootPressed=millis();bootLongHandled=bootSetupHandled=bootLongStopped=false;}
+    else if(bootSetupHandled){} // Release after the 10 s hold that opened setup.
+    else if(setupMode){if(!bootLongHandled)cancelSetupMode();}
+    else if(bootLongHandled){
+      // Released between 3 s and 10 s: switch primary/backup Wi-Fi.
+      if(!bootLongStopped){selectOtherWifi();if(wifiRestartPending){delay(100);ESP.restart();}}
+    }
+    else onBootShort();
   }
-  if(stableButton==LOW&&!bootLongHandled&&!genBusy&&millis()-bootPressed>=3000){bootLongHandled=true;selectOtherWifi();}
+  if(stableButton==LOW&&!setupMode&&!genBusy){
+    uint32_t held=millis()-bootPressed;
+    if(held>=SETUP_HOLD_MS&&!bootSetupHandled){bootSetupHandled=bootLongHandled=true;buttonTone(1320);enterSetupMode();}
+    else if(held>=3000&&!bootLongHandled){
+      bootLongHandled=true;
+      if(wanted){bootLongStopped=true;stopSession("Stopped. Hold BOOT 10s for setup");}
+      else status(backupSsid.length()?"Release: switch Wi-Fi. Hold: setup":"Keep holding for setup");
+    }
+  }
   bool side=digitalRead(SIDE_BUTTON_PIN);
   if(side!=lastSide){lastActivity=millis();lastSide=side;sideChanged=millis();}
   if(side!=stableSide&&millis()-sideChanged>40){stableSide=side;
     if(side==LOW){sidePressed=millis();sideLongHandled=false;}
-    else if(!sideLongHandled)onSidePress(); // Fire on release so a long hold never creates.
+    else if(!sideLongHandled&&!setupMode)onSidePress(); // Fire on release so a long hold never creates.
   }
   if(stableSide==LOW&&!sideLongHandled&&millis()-sidePressed>=POWER_OFF_HOLD_MS){sideLongHandled=true;powerOff();}
+  // Setup portal owns Wi-Fi: no sessions, reconnects or idle sleep until it restarts.
+  if(setupMode){setupLoop();delay(1);return;}
   if(wanted)ws.loop();
   if(wanted&&!live&&millis()-connectStarted>20000)stopSession("Connection timeout");
   if(live&&millis()-sessionStarted>5*60*1000)endTranscription();
   if(configured&&!wanted&&!genBusy) {
     if(WiFi.status()==WL_CONNECTED&&(lastScreen=="Connecting home Wi-Fi"||lastScreen=="Connecting hotspot"))status(selectedHotspot?"Hotspot ready. BOOT":"Home Wi-Fi ready. BOOT");
-    else if(WiFi.status()!=WL_CONNECTED&&millis()-wifiAttempt>30000){status(selectedHotspot?"Hotspot failed. Hold BOOT for home":"Home Wi-Fi failed. Check setup");WiFi.reconnect();wifiAttempt=millis();}
+    else if(WiFi.status()!=WL_CONNECTED&&millis()-wifiAttempt>30000){status(selectedHotspot?"Hotspot failed. Hold BOOT for home":"Wi-Fi failed. Hold BOOT 10s for setup");WiFi.reconnect();wifiAttempt=millis();}
   }
   MicFrame frame;
   if(audioReady&&xQueueReceive(micQueue,&frame,0)==pdTRUE&&live) {

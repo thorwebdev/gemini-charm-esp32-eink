@@ -4,7 +4,7 @@ Included: application source, required drivers/vendor source and licenses, publi
 
 Excluded: compiled firmware and full-flash images, NVS/device snapshots, logs and transcripts, personal paths/board identity, real credentials and API keys.
 
-Credentials are provided at runtime over USB serial; they are stored on the board, not in this repository. Public CA certificates are trust anchors, not private keys. Upstream copyright attribution is retained.
+Credentials are provided at runtime, either from a phone through the device's setup hotspot or over USB serial. They are stored on the board, not in this repository. The setup hotspot is WPA2-protected with a random password generated for each setup session and shown only on the device's screen. The setup page is plain HTTP on that local hotspot, so credentials never leave it. The page never sends a saved Wi-Fi password or API key back to the phone. Public CA certificates are trust anchors, not private keys. Upstream copyright attribution is retained.
 
 Microphone audio is streamed to the Gemini API only while a transcription session is active (after pressing BOOT, until stopped or the session ends).
 

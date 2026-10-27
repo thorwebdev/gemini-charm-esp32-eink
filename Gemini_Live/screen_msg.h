@@ -12,6 +12,7 @@ enum ScreenMode:uint8_t{
   MODE_BUSY,     // generation in progress: caption + small body line
   MODE_IMAGE,    // full-screen 1-bit image from imageBitmap
   MODE_PANEL,    // caption label + wrapped body (speech reply, lyrics, voice)
+  MODE_QR,       // setup: caption title + QR code of `text` + `status` hint line
 };
 struct ScreenMsg {
   char status[96];

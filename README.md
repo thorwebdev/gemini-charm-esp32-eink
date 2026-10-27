@@ -12,6 +12,8 @@ Then press the side button to turn what you said into something: Gemini Flash-Li
 
 Language is detected automatically. Includes e-paper display, battery indicator, light sleep and backup Wi-Fi.
 
+Setup needs no computer. On first boot the screen shows a QR code: scan it to join the device's setup hotspot, then scan the second QR code (or wait for the sign-in page) to choose your Wi-Fi and paste your Gemini API key. Hold BOOT for 10 seconds to run setup again.
+
 During idle light sleep, Wi-Fi and audio turn off; BOOT wakes the device. Battery life has not yet been measured.
 
 On battery, hold PWR (the side button) for about 2 seconds to turn on; hold it for 3 seconds to power off. A short press of PWR is "create" and fires when released. On USB, power off falls back to deep sleep and PWR wakes it.
