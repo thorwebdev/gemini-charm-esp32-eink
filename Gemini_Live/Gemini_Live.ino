@@ -2,6 +2,7 @@
 #include <HWCDC.h>
 #include "esp_sleep.h"
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
 #include "esp_sntp.h"
 #include "esp_netif.h"
 #include <math.h>
@@ -43,6 +44,12 @@ struct MicFrame { int16_t samples[512]; };
 bool audioReady=false,wanted=false,live=false,configured=false;
 bool lastButton=HIGH,stableButton=HIGH;
 bool lastSide=HIGH,stableSide=HIGH;
+// The side button is the board's PWR key: short press = create (on release), long hold = power off.
+bool sideLongHandled=false;
+uint32_t sidePressed=0;
+constexpr uint32_t POWER_OFF_HOLD_MS=3000;
+// Set once power-off starts so genTask cannot draw over the "Powered off" screen.
+volatile bool poweringOff=false;
 uint32_t buttonChanged=0,sideChanged=0,connectStarted=0,sessionStarted=0,wifiAttempt=0;
 String lastScreen;
 int batteryPercent=-1;
@@ -156,6 +163,7 @@ void pushScreen() {
 }
 // Body is raw UTF-8. Safe to call from the loop and genTask.
 void showScreen(uint8_t mode,const char *caption,const String &body,const char *footer,bool filled) {
+  if(poweringOff)return;
   xSemaphoreTake(screenLock,portMAX_DELAY);
   screenMode=mode;screenCaption=toDisplayText(caption);screenBody=toDisplayText(body.c_str());
   screenFooter=footer;screenFilled=filled;
@@ -169,22 +177,26 @@ bool isConnectingText(const String &s) {
   return s.indexOf("Connecting hotspot")>=0||s.indexOf("Switching to hotspot")>=0||
          s.indexOf("Connecting home Wi-Fi")>=0||s.indexOf("Switching to home")>=0;
 }
+// Light sleep and power off both park the panel after drawing.
+bool isParkedText(const String &s) { return s=="Light sleep"||s=="Powered off"; }
 // Home screen with a status line. An image result stays up (photo frame) through sleep
 // and Wi-Fi reconnects; any other status replaces it.
 void status(const String &s) {
+  if(poweringOff&&s!="Powered off")return;
   xSemaphoreTake(screenLock,portMAX_DELAY);
-  bool keepImage=screenMode==MODE_IMAGE&&(s=="Light sleep"||isReadyText(s)||isConnectingText(s));
+  bool keepImage=screenMode==MODE_IMAGE&&(isParkedText(s)||isReadyText(s)||isConnectingText(s));
   if(s==lastScreen&&(screenMode==MODE_HOME||keepImage)){xSemaphoreGive(screenLock);return;}
   lastScreen=s;
   Serial.println("STATUS: "+s);
   if(keepImage){
-    if(s=="Light sleep")pushScreenLocked(); // Screen task only parks the panel.
+    if(isParkedText(s))pushScreenLocked(); // Screen task only parks the panel.
     xSemaphoreGive(screenLock);return;
   }
   screenMode=MODE_HOME;screenFilled=false;screenBody="";
   screenCaption=activeVoiceName.length()?toDisplayText(("Voice: "+activeVoiceName).c_str()):String();
   bool connected=WiFi.status()==WL_CONNECTED&&!isConnectingText(s);
   screenFooter=s=="Light sleep"?"Click BOOT to wake up":
+               s=="Powered off"?"Hold PWR to turn on":
                (isReadyText(s)||(connected&&configured&&!wanted))?"BOOT: start transcribing":"";
   pushScreenLocked();
   xSemaphoreGive(screenLock);
@@ -314,7 +326,8 @@ void screenTask(void*) {
   static ScreenMsg msg;
   for(;;) if(xQueueReceive(screenQueue,&msg,portMAX_DELAY)) {
     const char *text=msg.status;
-    bool sleeping=strcmp(text,"Light sleep")==0;
+    bool poweredOff=strcmp(text,"Powered off")==0;
+    bool sleeping=poweredOff||strcmp(text,"Light sleep")==0;
     // Photo frame: leave the image on the panel and only power it down.
     if(sleeping&&msg.mode==MODE_IMAGE){
       if(!panelAsleep){display.EPD_Sleep();digitalWrite(6,HIGH);panelAsleep=true;}
@@ -354,7 +367,7 @@ void screenTask(void*) {
           break;
         default:
           iconHome(canvas,sleeping);
-          centeredText(canvas,sleeping?"Light sleep":"Transcribe",146,2);
+          centeredText(canvas,poweredOff?"Powered off":sleeping?"Light sleep":"Transcribe",146,2);
           // Keep errors and setup prompts visible; ready/connecting home stays clean.
           if(!sleeping&&!ready&&!connectingHotspot&&!connectingWifi)statusLines(canvas,text,166);
           else if(ready&&msg.caption[0])centeredText(canvas,msg.caption,168,1);
@@ -690,8 +703,11 @@ void readSetup() {
 void setup() {
   // Waveshare ESP32-S3-ePaper-1.54 V2: keep battery power latched on.
   // Assert before USB logging and peripheral startup so PWR can be released.
+  // A USB power-off (deep sleep) leaves GPIO17 held low and GPIO18 as an RTC pin; undo both.
+  gpio_hold_dis(GPIO_NUM_17);gpio_deep_sleep_hold_dis();
   pinMode(17,OUTPUT);
   digitalWrite(17,HIGH);
+  rtc_gpio_deinit(GPIO_NUM_18);
   analogReadResolution(12);analogSetPinAttenuation(4,ADC_11db);
   sampleBattery();lastBatterySample=millis();lastUsbConnected=HWCDC::isPlugged();
   Serial.begin(115200);delay(1500);pinMode(0,INPUT_PULLUP);pinMode(SIDE_BUTTON_PIN,INPUT_PULLUP);
@@ -722,7 +738,10 @@ void setup() {
   configured=!ssid.isEmpty()&&!apiKey.isEmpty();
   if(configured)connectWifi();else status("Enter setup on Mac");
   lastActivity=millis();
-  Serial.printf("GEMINI_FIRMWARE_READY: transcribe-create-v1 model=%s voice=%s idle=120s mic_gain=18 wake=BOOT\n",
+  // PWR is usually still held from powering on: treat it as already handled so its
+  // release does not trigger "create" and holding on does not power straight back off.
+  lastSide=stableSide=digitalRead(SIDE_BUTTON_PIN);sideChanged=millis();sideLongHandled=stableSide==LOW;
+  Serial.printf("GEMINI_FIRMWARE_READY: transcribe-create-v1 model=%s voice=%s idle=120s mic_gain=18 wake=BOOT power_off=PWR3s\n",
                 TRANSCRIBE_MODEL,activeVoiceName.length()?activeVoiceName.c_str():DEFAULT_VOICE);
 }
 // The audio worker acknowledges only between complete I2S blocks.
@@ -760,7 +779,7 @@ void enterIdleSleep() {
   audioHold=false;
   while(digitalRead(0)==LOW)delay(10);
   lastButton=stableButton=HIGH;buttonChanged=millis();bootLongHandled=false;wifiRestartPending=false;
-  lastSide=stableSide=digitalRead(SIDE_BUTTON_PIN);sideChanged=millis();
+  lastSide=stableSide=digitalRead(SIDE_BUTTON_PIN);sideChanged=millis();sideLongHandled=stableSide==LOW;
   lastActivity=millis();lastBatterySample=millis();
   if(configured)connectWifi();else status("Enter setup on Mac");
 }
@@ -781,6 +800,30 @@ void onSidePress() {
   }
   buttonTone(1320);
   startGeneration();
+}
+// Long PWR hold. On battery, dropping the GPIO17 latch cuts power once PWR is released
+// (the key itself powers the board while held). On USB the board stays powered, so deep
+// sleep stands in for "off"; PWR then wakes it through a fresh boot.
+void powerOff() {
+  Serial.println("POWER_OFF: requested");
+  buttonTone(330);delay(200);
+  if(genBusy)cancelGeneration();
+  poweringOff=true;
+  if(wanted){wanted=live=false;ws.disconnect();}
+  if(esp_sntp_enabled())esp_sntp_stop();
+  WiFi.disconnect(false,false);WiFi.mode(WIFI_OFF);
+  while(xSemaphoreTake(sleepScreenReady,0)==pdTRUE){}
+  status("Powered off");
+  xSemaphoreTake(sleepScreenReady,pdMS_TO_TICKS(15000));
+  digitalWrite(17,LOW);
+  while(digitalRead(SIDE_BUTTON_PIN)==LOW)delay(10);
+  delay(500);
+  // Still running, so USB is powering the board.
+  Serial.println("POWER_OFF: on USB, deep sleep until PWR");Serial.flush();
+  gpio_hold_en(GPIO_NUM_17);gpio_deep_sleep_hold_en();
+  rtc_gpio_pullup_en(GPIO_NUM_18);rtc_gpio_pulldown_dis(GPIO_NUM_18);
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_18,0);
+  esp_deep_sleep_start();
 }
 
 void loop() {
@@ -809,7 +852,11 @@ void loop() {
   if(stableButton==LOW&&!bootLongHandled&&!genBusy&&millis()-bootPressed>=3000){bootLongHandled=true;selectOtherWifi();}
   bool side=digitalRead(SIDE_BUTTON_PIN);
   if(side!=lastSide){lastActivity=millis();lastSide=side;sideChanged=millis();}
-  if(side!=stableSide&&millis()-sideChanged>40){stableSide=side;if(side==LOW)onSidePress();}
+  if(side!=stableSide&&millis()-sideChanged>40){stableSide=side;
+    if(side==LOW){sidePressed=millis();sideLongHandled=false;}
+    else if(!sideLongHandled)onSidePress(); // Fire on release so a long hold never creates.
+  }
+  if(stableSide==LOW&&!sideLongHandled&&millis()-sidePressed>=POWER_OFF_HOLD_MS){sideLongHandled=true;powerOff();}
   if(wanted)ws.loop();
   if(wanted&&!live&&millis()-connectStarted>20000)stopSession("Connection timeout");
   if(live&&millis()-sessionStarted>5*60*1000)endTranscription();

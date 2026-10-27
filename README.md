@@ -14,6 +14,8 @@ Language is detected automatically. Includes e-paper display, battery indicator,
 
 During idle light sleep, Wi-Fi and audio turn off; BOOT wakes the device. Battery life has not yet been measured.
 
+On battery, hold PWR (the side button) for about 2 seconds to turn on; hold it for 3 seconds to power off. A short press of PWR is "create" and fires when released. On USB, power off falls back to deep sleep and PWR wakes it.
+
 ## Build and setup
 
 - [Build guide](docs/BUILD.md)
