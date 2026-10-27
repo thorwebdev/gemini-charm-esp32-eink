@@ -19,7 +19,12 @@ const char *VOICE_DESIGN_MODEL="gemini-3.8-flash-tts";
 const char *SONG_MODEL="lyria-3-clip-preview";
 const char *DEFAULT_VOICE="Kore";
 constexpr uint32_t TTS_RATE=24000; // Streaming TTS default: headerless L16, 24 kHz mono.
-constexpr uint32_t PREROLL_MS=600; // Buffered speech before playback starts (absorbs network jitter).
+constexpr uint32_t PREROLL_MS=600; // Minimum buffered speech before playback starts (absorbs network jitter).
+// Adaptive pre-roll: speech only starts once the buffer covers the predicted shortfall of a
+// stream slower than real time, so slow Wi-Fi means a longer wait instead of choppy audio.
+constexpr uint32_t SPEED_WINDOW_MS=1000;    // Stream time measured before trusting the speed estimate.
+constexpr float SPEECH_CHARS_PER_SEC=10.0f; // Deliberately slow speaking rate: the length estimate errs long.
+constexpr float SPEED_TARGET=1.15f;         // Streams at least this much faster than real time need only PREROLL_MS.
 
 struct Route { String action,prompt,style,voiceName,gender,language; };
 
@@ -34,12 +39,19 @@ bool collectMedia(PsBuffer &dst,PsBuffer &chunk) {
 
 // POST /v1beta/interactions with stream:true. `onDelta` receives each step.delta
 // (outside thought steps); return false to stop. Returns 200 on a clean stream.
+// No thinking_level: per the docs the image model already defaults to minimal, and the
+// TTS and Lyria models reject the field.
 int interactionStream(JsonDocument &req,DeltaHandler onDelta,uint32_t idleMs=65000) {
   req["stream"]=true;
   String body;serializeJson(req,body);
   bool apiError=false,thoughtStep=false;
+  uint32_t t0=millis();
   int code=geminiStream("/v1beta/interactions",body,[&](JsonDocument &ev,PsBuffer &blob)->bool{
     const char *type=ev["event_type"] | "";
+    // Timeline of where the bytes go (skips the many small audio/text deltas).
+    if(strcmp(type,"step.delta")||blob.len>16384)
+      Serial.printf("GEMINI_EVENT: +%ums %s%s%s blob=%u\n",(unsigned)(millis()-t0),type,
+                    !strcmp(type,"step.start")?" step=":"",!strcmp(type,"step.start")?(ev["step"]["type"] | "?"):"",(unsigned)blob.len);
     if(!strcmp(type,"error")){
       Serial.printf("GEMINI_API_ERROR: stream code=%s\n",ev["error"]["code"].as<String>().c_str());
       apiError=true;return false;
@@ -70,7 +82,8 @@ struct RingSink {
     while(pos<=1.0f){emit((int16_t)(prev+(s-prev)*pos));pos+=step;}
     pos-=1.0f;prev=s;
   }
-  void flush(){if(count)enqueueAudioWait(buf,count);count=0;}
+  // While playback is gated nothing drains the ring; open the gate rather than block forever when it fills.
+  void flush(){if(count){if(audioGate&&audioUsed+count>RING_SAMPLES-2048){audioGate=false;Serial.println("PLAYBACK: ring full, starting");}enqueueAudioWait(buf,count);}count=0;}
 };
 
 void playPcm(const uint8_t *data,size_t bytes,uint32_t rate,int channels) {
@@ -199,6 +212,7 @@ bool routePrompt(const String &prompt,Route &route) {
   props["gender"]["type"]="STRING";
   for(const char *g:{"male","female","neutral"})props["gender"]["enum"].add(g);
   schema["required"].add("action");schema["required"].add("prompt");
+  // No thinkingConfig: gemini-3.5-flash-lite already defaults to minimal thinking.
   String body;serializeJson(req,body);
   // The JSON answer streams in as text chunks; concatenate the non-thought parts.
   String text;bool apiError=false;
@@ -233,14 +247,18 @@ void doImage(const Route &route) {
   req["model"]=IMAGE_MODEL;req["input"]=route.prompt;
   auto format=req["response_format"];
   format["type"]="image";format["mime_type"]="image/jpeg";format["aspect_ratio"]="1:1";format["image_size"]=IMAGE_SIZE_OPT;
-  PsBuffer jpg;bool bad=false;String mime;
+  PsBuffer jpg;bool bad=false,complete=false;String mime;
   uint32_t started=millis();
   int code=interactionStream(req,[&](JsonVariant d,PsBuffer &bytes)->bool{
     if(d["type"]=="image"&&bytes.len){
       if(mime.isEmpty())mime=d["mime_type"] | "";
       if(!collectMedia(jpg,bytes))bad=true;
+      // A JPEG ends with the EOI marker. Anything the server sends after the final image
+      // (closing events that may repeat the output) is not worth downloading on slow Wi-Fi.
+      complete=jpg.len>4&&jpg.data[0]==0xFF&&jpg.data[1]==0xD8&&jpg.data[jpg.len-2]==0xFF&&jpg.data[jpg.len-1]==0xD9;
+      if(complete)Serial.printf("IMAGE: complete after %ums, closing stream\n",(unsigned)(millis()-started));
     }
-    return !genCancel&&!bad;
+    return !genCancel&&!bad&&!complete;
   });
   if(genCancel){genCancelled();return;}
   if(code!=200&&!jpg.len){genFail("Image failed. Try again");return;}
@@ -255,7 +273,8 @@ void doImage(const Route &route) {
   showScreen(MODE_IMAGE,"",route.prompt,"",false);
 }
 
-// Streams L16 audio straight into the playback ring; playback starts after a short pre-roll.
+// Streams L16 audio into the playback ring. Playback waits until enough is buffered to play
+// through without gaps: about PREROLL_MS on a fast link, up to the whole clip on a slow one.
 void doSpeech(const String &text,const String &style) {
   showBusy("Recording voice...",text);
   JsonDocument req;
@@ -268,29 +287,45 @@ void doSpeech(const String &text,const String &style) {
   format["type"]="audio";format["mime_type"]="audio/l16";
   req["generation_config"]["speech_config"][0]["voice"]=activeVoiceId.length()?activeVoiceId:String(DEFAULT_VOICE);
   RingSink sink;
-  bool started=false,haveOdd=false;uint8_t odd=0;
-  uint32_t rate=TTS_RATE;size_t samples=0;
+  bool started=false,haveOdd=false,playStarted=false,slowShown=false;uint8_t odd=0;
+  uint32_t rate=TTS_RATE,firstAudio=0;size_t samples=0;
+  const float estSeconds=max(2.0f,text.length()/SPEECH_CHARS_PER_SEC);
+  auto startPlayback=[&](const char *why,float speed){
+    sink.flush();audioGate=false;playStarted=true;
+    Serial.printf("PLAYBACK: start (%s) buffered=%.1fs est=%.1fs speed=%.2fx wait=%ums\n",
+                  why,(float)samples/rate,estSeconds,speed,(unsigned)(millis()-firstAudio));
+    appState=APP_PLAYING;
+    showScreen(MODE_PANEL,"SPEECH",text,"BOOT: stop",true);
+  };
   int code=interactionStream(req,[&](JsonVariant d,PsBuffer &chunk)->bool{
     if(d["type"]!="audio")return !genCancel;
     if(!started){
       const char *mime=d["mime_type"] | "";
       rate=mimeRate(mime,d["sample_rate"] | TTS_RATE);
-      audioGate=true;sink.begin(rate);started=true;
+      audioGate=true;sink.begin(rate);started=true;firstAudio=millis();
       Serial.printf("PLAYBACK: streaming mime=%s rate=%u codec=%u\n",mime,(unsigned)rate,(unsigned)codecRate);
-      appState=APP_PLAYING;
-      showScreen(MODE_PANEL,"SPEECH",text,"BOOT: stop",true);
     }
     size_t i=0;
     if(haveOdd&&chunk.len){sink.push((int16_t)(odd|chunk.data[0]<<8));i=1;haveOdd=false;samples++;}
     for(;i+1<chunk.len;i+=2){sink.push((int16_t)(chunk.data[i]|chunk.data[i+1]<<8));samples++;}
     if(i<chunk.len){odd=chunk.data[i];haveOdd=true;}
-    if(audioGate&&samples>=rate*PREROLL_MS/1000){sink.flush();audioGate=false;}
+    if(!playStarted&&!audioGate)playStarted=true; // Ring-full valve already opened the gate.
+    uint32_t elapsed=millis()-firstAudio;
+    if(!playStarted&&elapsed>=SPEED_WINDOW_MS){
+      float buffered=(float)samples/rate,speed=buffered/(elapsed/1000.0f);
+      // Audio still to arrive after starting must not outrun playback, with a 25% margin + 0.5 s.
+      float total=max(estSeconds,buffered);
+      float need=max(PREROLL_MS/1000.0f,total*max(0.0f,SPEED_TARGET-speed)*1.25f+0.5f);
+      if(buffered>=need)startPlayback("ready",speed);
+      else if(!slowShown&&speed<1.0f){slowShown=true;showBusy("Buffering...","Slow Wi-Fi: playing when ready");}
+    }
     return !genCancel;
   });
+  if(started&&!playStarted&&!genCancel)startPlayback("complete",0);
   sink.flush();audioGate=false;
   if(genCancel){genCancelled();return;}
   if(!started){genFail(code==200?"No audio returned":"Speech failed. Try again");return;}
-  Serial.printf("SPEECH: %u samples, stream=%d\n",(unsigned)samples,code);
+  Serial.printf("SPEECH: %u samples, stream=%d, %ums\n",(unsigned)samples,code,(unsigned)(millis()-firstAudio));
   finishPlayback();
   if(genCancel){genCancelled();return;}
   appState=APP_RESULT;

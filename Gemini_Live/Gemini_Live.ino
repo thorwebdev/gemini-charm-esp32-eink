@@ -645,7 +645,11 @@ void connectWifi() {
   // SNTP must not have a DNS query pending when the first lookup clears the DNS cache (see primeNetwork).
   if(esp_sntp_enabled())esp_sntp_stop();
   netPrimed=false;
-  WiFi.mode(WIFI_STA);WiFi.begin((selectedHotspot?backupSsid:ssid).c_str(),(selectedHotspot?backupPassword:password).c_str());
+  WiFi.mode(WIFI_STA);
+  // Modem sleep delays downlink packets to the next beacon; with the core's 5.7 KB TCP window
+  // that caps media downloads. Idle light sleep turns Wi-Fi off anyway.
+  WiFi.setSleep(false);
+  WiFi.begin((selectedHotspot?backupSsid:ssid).c_str(),(selectedHotspot?backupPassword:password).c_str());
   wifiAttempt=millis();status(selectedHotspot?"Connecting hotspot":"Connecting home Wi-Fi");
 }
 // arduino-esp32 3.3.0: the first hostByName() after the IP changes calls dns_clear_cache()
