@@ -31,7 +31,10 @@ cd gemini-live-agent
 arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
 arduino-cli core install esp32:esp32@3.3.0 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
 arduino-cli lib install "ArduinoJson@7.4.3" "Adafruit GFX Library@1.12.6" "Adafruit BusIO@1.17.4" "JPEGDEC@1.8.4" "ESP8266Audio@2.4.1"
+arduino-cli lib install "U8g2_for_Adafruit_GFX@1.8.0" --no-deps
 ```
+
+`--no-deps` keeps Adafruit GFX at the tested 1.12.6 (otherwise U8g2_for_Adafruit_GFX pulls the latest). U8g2_for_Adafruit_GFX provides the Chinese (WenQuanYi, GB2312) and Devanagari (GNU Unifont) fonts used for transcripts; they add roughly 530 KB of flash.
 
 WebSockets, codec board, ESP codec and the QR code generator ([Nayuki qrcodegen](https://github.com/nayuki/QR-Code-generator), MIT) sources are bundled. The setup portal uses `WebServer` and `DNSServer` from the ESP32 core. Do not install a different WebSockets implementation in place of the bundled code.
 

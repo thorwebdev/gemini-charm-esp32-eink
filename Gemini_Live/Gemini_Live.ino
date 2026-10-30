@@ -18,6 +18,8 @@
 #include "google_roots.h"
 #include "screen_msg.h"
 #include "src/qrcodegen/qrcodegen.h"
+#include <U8g2_for_Adafruit_GFX.h>
+#include "text_render.h"
 
 // Live transcription: stream mic audio to the transcribe model with SMART formatting.
 // Interim hypotheses render while speaking; the cleaned transcript replaces them once
@@ -64,7 +66,7 @@ uint32_t lastActivity=0;
 // audioHold parks the audio worker between I2S blocks (light sleep, codec rate change).
 volatile bool audioHold=false,audioPaused=false;
 SemaphoreHandle_t sleepScreenReady=nullptr;
-String interimText,smartText; // Raw UTF-8; converted to CP437 when pushed to the screen.
+String interimText,smartText; // Raw UTF-8.
 uint8_t transcriptKind=TRANSCRIPT_NONE;
 bool smartSegmentOpen=false;
 String sessionPrompt; // All smart segments of the current session, newline-joined.
@@ -84,7 +86,8 @@ volatile uint32_t codecRate=16000;
 // Screen state shared by the loop and genTask; guarded by screenLock.
 SemaphoreHandle_t screenLock=nullptr;
 uint8_t screenMode=MODE_HOME;
-String screenCaption,screenBody,screenFooter; // Already converted to CP437.
+String screenCaption,screenFooter; // Already converted to CP437.
+String screenBody; // Raw UTF-8; PanelText draws it (QR mode: the QR payload).
 bool screenFilled=false;
 uint8_t imageBitmap[IMAGE_BYTES];
 String activeVoiceId,activeVoiceName;
@@ -115,22 +118,7 @@ void sampleBattery(){
 
 bool lastUsbConnected=false;
 
-// The built-in GFX font is CP437; map common UTF-8 (German, French, Spanish,
-// typographic punctuation) so transcripts render instead of showing garbage.
-const char *cp437Glyph(uint32_t cp) {
-  struct Glyph{uint16_t cp;const char *out;};
-  static const Glyph glyphs[]={
-    {0xE4,"\x84"},{0xF6,"\x94"},{0xFC,"\x81"},{0xC4,"\x8E"},{0xD6,"\x99"},{0xDC,"\x9A"},{0xDF,"\xE1"},
-    {0xE9,"\x82"},{0xE8,"\x8A"},{0xEA,"\x88"},{0xEB,"\x89"},{0xE0,"\x85"},{0xE2,"\x83"},{0xE7,"\x87"},
-    {0xC7,"\x80"},{0xC9,"\x90"},{0xEF,"\x8B"},{0xEE,"\x8C"},{0xEC,"\x8D"},{0xF4,"\x93"},{0xF2,"\x95"},
-    {0xFB,"\x96"},{0xF9,"\x97"},{0xFF,"\x98"},{0xE1,"\xA0"},{0xED,"\xA1"},{0xF3,"\xA2"},{0xFA,"\xA3"},
-    {0xF1,"\xA4"},{0xD1,"\xA5"},{0xBF,"\xA8"},{0xA1,"\xAD"},{0xB0,"\xF8"},{0xE5,"\x86"},{0xC5,"\x8F"},
-    {0xE6,"\x91"},{0xC6,"\x92"},{0xA3,"\x9C"},{0xA0," "},{0x20AC,"EUR"},{0x2018,"'"},{0x2019,"'"},
-    {0x201C,"\""},{0x201D,"\""},{0x201E,"\""},{0x2013,"-"},{0x2014,"-"},{0x2022,"-"},{0x2026,"..."},
-  };
-  for(auto &g:glyphs)if(g.cp==cp)return g.out;
-  return cp>=0x1F000?"":"?"; // Drop emoji, mark other unsupported glyphs.
-}
+// Captions and status lines use the built-in CP437 font; see cp437Glyph() in text_render.h.
 String toDisplayText(const char *in) {
   String out;const uint8_t *s=(const uint8_t*)in;size_t n=strlen(in);out.reserve(n);
   for(size_t i=0;i<n;){
@@ -155,6 +143,7 @@ void pushScreenLocked() {
   screenCaption.toCharArray(msg.caption,sizeof(msg.caption));
   screenFooter.toCharArray(msg.footer,sizeof(msg.footer));
   size_t start=screenBody.length()>TRANSCRIPT_CAP-1?screenBody.length()-(TRANSCRIPT_CAP-1):0;
+  while(start<screenBody.length()&&((uint8_t)screenBody[start]&0xC0)==0x80)start++; // UTF-8 boundary
   strncpy(msg.text,screenBody.c_str()+start,TRANSCRIPT_CAP-1);
   xQueueOverwrite(screenQueue,&msg);
 }
@@ -169,7 +158,7 @@ void pushScreen() {
 void showScreen(uint8_t mode,const char *caption,const String &body,const char *footer,bool filled) {
   if(poweringOff)return;
   xSemaphoreTake(screenLock,portMAX_DELAY);
-  screenMode=mode;screenCaption=toDisplayText(caption);screenBody=toDisplayText(body.c_str());
+  screenMode=mode;screenCaption=toDisplayText(caption);screenBody=body;
   screenFooter=footer;screenFilled=filled;
   pushScreenLocked();
   xSemaphoreGive(screenLock);
@@ -279,28 +268,8 @@ void drawQr(GFXcanvas1 &c,const char *payload,int top,int avail) {
   for(int y=0;y<n;y++)for(int x=0;x<n;x++)
     if(qrcodegen_getModule(qr,x,y))c.fillRect(x0+x*scale,y0+y*scale,scale,scale,0);
 }
-// Word-wraps text and keeps only the last `cap` lines so the newest words stay visible.
-// Returns the total line count, which may exceed `cap`.
-int wrapText(const char *t,int cols,int16_t *starts,uint8_t *lens,int cap) {
-  int len=strlen(t),pos=0,total=0;
-  auto add=[&](int s,int l){
-    if(total<cap){starts[total]=s;lens[total]=l;}
-    else {memmove(starts,starts+1,(cap-1)*sizeof(int16_t));memmove(lens,lens+1,cap-1);starts[cap-1]=s;lens[cap-1]=l;}
-    total++;
-  };
-  while(pos<len){
-    int j=pos,lastSpace=-1;
-    while(j<len&&t[j]!='\n'&&j-pos<cols){if(t[j]==' ')lastSpace=j;j++;}
-    int end,next;
-    if(j>=len||t[j]=='\n'){end=j;next=j+1;}
-    else if(t[j]==' '){end=j;next=j+1;}
-    else if(lastSpace>pos){end=lastSpace;next=lastSpace+1;}
-    else {end=j;next=j;} // Hard-break words longer than a line.
-    add(pos,end-pos);pos=next;
-    while(pos<len&&t[pos]==' ')pos++;
-  }
-  return total;
-}
+// Body text renderer (UTF-8: Latin, Chinese, Devanagari). Used only by screenTask.
+PanelText panelText;
 // Caption pill (filled = final result) plus large text while it fits, then small text
 // showing the most recent lines.
 void drawPanel(GFXcanvas1 &c,const char *label,bool filled,const char *text) {
@@ -311,15 +280,30 @@ void drawPanel(GFXcanvas1 &c,const char *label,bool filled,const char *text) {
     else c.drawRoundRect(x,33,w,13,6,0);
     c.setCursor(x+6,36);c.print(label);c.setTextColor(0);
   }
-  static int16_t starts[14];static uint8_t lens[14];
+  static int16_t starts[TEXT_MAX_LINES];static uint16_t lens[TEXT_MAX_LINES];
   const char *t=text;while(*t==' '||*t=='\n')t++;
-  int size=2,maxLines=8,lineHeight=17;
-  int total=wrapText(t,16,starts,lens,maxLines);
-  if(total>maxLines){size=1;maxLines=14;lineHeight=10;total=wrapText(t,32,starts,lens,maxLines);}
-  c.setTextSize(size);
+  panelText.begin(c);
+  // Lines fill y=50..190: 8 large or 14 small Latin lines; taller scripts get fewer.
+  int ascent=0,descent=0,lineHeight=17,maxLines=8,total=0;
+  for(int size=2;size>=1;size--){
+    panelText.setSize(size);panelText.metrics(t,ascent,descent);
+    lineHeight=max(size>1?17:10,ascent+descent+1);
+    maxLines=min(TEXT_MAX_LINES,140/lineHeight);
+    total=panelText.wrap(t,192,starts,lens,maxLines,true);
+    if(total<=maxLines)break;
+  }
+  for(int i=0;i<min(total,maxLines);i++)panelText.drawLine(4,50+i*lineHeight+ascent,t+starts[i],lens[i]);
+}
+// The start of `text` in small type, centered from y: two lines, or one for tall scripts.
+void bodyLines(GFXcanvas1 &c,const char *text,int y) {
+  int16_t starts[2];uint16_t lens[2];
+  int ascent,descent;
+  panelText.begin(c);panelText.setSize(1);panelText.metrics(text,ascent,descent);
+  int lineHeight=max(11,ascent+descent+1),maxLines=lineHeight<=11?2:1;
+  int total=panelText.wrap(text,192,starts,lens,maxLines,false);
   for(int i=0;i<min(total,maxLines);i++){
-    c.setCursor(4,50+i*lineHeight);
-    for(int k=0;k<lens[i];k++)c.write((uint8_t)t[starts[i]+k]);
+    int w=panelText.width(text+starts[i],lens[i]);
+    panelText.drawLine(max(4,(200-w)/2),y+i*lineHeight+ascent,text+starts[i],lens[i]);
   }
 }
 // Up to two centered lines of small text.
@@ -379,7 +363,7 @@ void screenTask(void*) {
         case MODE_BUSY:
           iconSpark(canvas);
           centeredText(canvas,msg.caption,146,strlen(msg.caption)*12<=196?2:1);
-          statusLines(canvas,msg.text,168);
+          bodyLines(canvas,msg.text,168);
           break;
         case MODE_QR:
           // Battery stays top-right; the USB label can reach y=33, so the title starts below it.
