@@ -47,8 +47,8 @@ bool bootSetupHandled=false,bootLongStopped=false;
 String ssid, password, apiKey, serialLine, fragments;
 #if defined(BOARD_M5STICKS3)
 volatile bool wantMicMode=false;
-constexpr uint8_t STICK_SPEAKER_VOL=230; // 0..255 (M5.Speaker applies quadratic scaling).
-constexpr uint8_t STICK_SPK_MAG=4;       // Clean loud gain for AW8737 amp (M5Unified default is 1).
+constexpr uint8_t STICK_SPEAKER_VOL=240; // 0..255 (M5.Speaker applies quadratic scaling).
+constexpr uint8_t STICK_SPK_MAG=12;      // Midpoint gain: ~3.3x louder than mag=4, clean below 0 dBFS.
 constexpr uint8_t STICK_DAC_VOL=0xBF;    // ES8311 reg 0x32: 0xBF = 0 dB (no digital clipping).
 uint16_t *imageRgb565=nullptr;
 #else
