@@ -2,9 +2,10 @@
 
 ## 1. Hardware
 
-Use the original compatible ESP32-S3 board: 8 MB flash, 8 MB OPI PSRAM, ES8311 speaker codec, ES7210 microphone codec and 200×200 e-paper panel. A generic ESP32-S3 without these peripherals needs driver/pin adaptations.
+Supported boards (select in `Gemini_Live/board_config.h` via `#define BOARD_M5STICKS3`):
 
-Display pins: CS 11, DC 10, RESET 9, BUSY 8, MOSI 13, clock 12, power control 6. BOOT button: GPIO 0. Side (create) button: GPIO 18. Audio wiring is defined in the sketch's `setup()` and bundled codec configuration. Check wiring against your actual board before powering it.
+- **M5Stack StickS3** (default): ESP32-S3-PICO-1-N8R8 (8 MB flash, 8 MB OPI PSRAM), 1.14" 135×240 ST7789 full-color LCD, ES8311 half-duplex mic/speaker + AW8737 PA, M5PM1 PMIC, `BtnA` (GPIO 11, main/transcribe/cancel/wake) and `BtnB` (GPIO 12, side/create/power-off).
+- **Waveshare ESP32-S3-ePaper-1.54 V2**: Comment out `#define BOARD_M5STICKS3` in `Gemini_Live/board_config.h`. 8 MB flash, 8 MB OPI PSRAM, ES8311 speaker codec, ES7210 microphone codec and 200×200 e-paper panel. Display pins: CS 11, DC 10, RESET 9, BUSY 8, MOSI 13, clock 12, power control 6. BOOT button: GPIO 0. Side (create) button: GPIO 18.
 
 ### Purchase options
 
@@ -30,7 +31,7 @@ cd gemini-live-agent
 ```sh
 arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
 arduino-cli core install esp32:esp32@3.3.0 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-arduino-cli lib install "ArduinoJson@7.4.3" "Adafruit GFX Library@1.12.6" "Adafruit BusIO@1.17.4" "JPEGDEC@1.8.4" "ESP8266Audio@2.4.1"
+arduino-cli lib install "ArduinoJson@7.4.3" "Adafruit GFX Library@1.12.6" "Adafruit BusIO@1.17.4" "JPEGDEC@1.8.4" "ESP8266Audio@2.4.1" "M5Unified" "M5GFX"
 arduino-cli lib install "U8g2_for_Adafruit_GFX@1.8.0" --no-deps
 ```
 

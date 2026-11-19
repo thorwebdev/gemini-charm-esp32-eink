@@ -177,10 +177,17 @@ void showQr(const char *caption,const String &payload,const String &hint,const c
 }
 void showSetupStep(uint8_t step) {
   setupStep=step;
+#if defined(BOARD_M5STICKS3)
+  const char *footer=configured?"A: cancel setup":"Hold B 3s: power off";
+  Serial.printf("SETUP_STEP: %u\n",step);
+  if(step==1)showQr("1/2: Scan Wi-Fi","WIFI:T:WPA;S:"+qrEscape(apSsid)+";P:"+qrEscape(apPass)+";;",apSsid+" "+apPass,footer);
+  else showQr("2/2: Open setup",SETUP_URL,"or 192.168.4.1",footer);
+#else
   const char *footer=configured?"BOOT: cancel setup":"Hold PWR 3s: power off";
   Serial.printf("SETUP_STEP: %u\n",step);
   if(step==1)showQr("Step 1/2: Scan to connect","WIFI:T:WPA;S:"+qrEscape(apSsid)+";P:"+qrEscape(apPass)+";;",apSsid+"  pw "+apPass,footer);
   else showQr("Step 2/2: Open setup page",SETUP_URL,"or visit 192.168.4.1",footer);
+#endif
 }
 
 // Nearby networks for the page: named, deduplicated, strongest first.

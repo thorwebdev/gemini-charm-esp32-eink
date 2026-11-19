@@ -75,3 +75,63 @@ bool jpegToBitmap(uint8_t *jpg,size_t len,uint8_t *bitmap) {
   free(gray);free(small);free(err);
   return ok;
 }
+
+#if defined(BOARD_M5STICKS3)
+struct RgbTarget { uint16_t *pixels; int width,height; };
+
+int jpegRgbDraw(JPEGDRAW *draw) {
+  auto *target=(RgbTarget*)draw->pUser;
+  const uint16_t *src=(const uint16_t*)draw->pPixels;
+  for(int y=0;y<draw->iHeight;y++){
+    int ty=draw->y+y;if(ty<0||ty>=target->height)continue;
+    for(int x=0;x<draw->iWidthUsed;x++){
+      int tx=draw->x+x;if(tx<0||tx>=target->width)continue;
+      target->pixels[ty*target->width+tx]=src[y*draw->iWidth+x];
+    }
+  }
+  return 1;
+}
+
+// Decodes a JPEG to RGB565, center-crops to match outW:outH, and box-filters to outW x outH.
+bool jpegToRgb565(uint8_t *jpg,size_t len,uint16_t *out,int outW,int outH) {
+  if(!out)return false;
+  JPEGDEC *jpeg=new JPEGDEC();
+  if(!jpeg)return false;
+  bool ok=false;
+  uint16_t *rgb=nullptr;
+  do {
+    if(!jpeg->openRAM(jpg,len,jpegRgbDraw)){Serial.printf("IMAGE: JPEG open failed %d\n",jpeg->getLastError());break;}
+    int w=jpeg->getWidth(),h=jpeg->getHeight();
+    int scale=max(w,h)>=800?JPEG_SCALE_QUARTER:max(w,h)>=400?JPEG_SCALE_HALF:0;
+    int div=scale==JPEG_SCALE_QUARTER?4:scale==JPEG_SCALE_HALF?2:1;
+    RgbTarget target={nullptr,(w+div-1)/div,(h+div-1)/div};
+    rgb=(uint16_t*)ps_calloc((size_t)target.width*target.height,sizeof(uint16_t));
+    if(!rgb)break;
+    target.pixels=rgb;
+    jpeg->setPixelType(RGB565_LITTLE_ENDIAN);jpeg->setUserPointer(&target);
+    if(!jpeg->decode(0,0,scale)){Serial.printf("IMAGE: JPEG decode failed %d\n",jpeg->getLastError());break;}
+    Serial.printf("IMAGE: decoded %dx%d -> %dx%d rgb565\n",w,h,target.width,target.height);
+    // Center-crop to match outW:outH aspect ratio.
+    int cropW=target.width,cropH=target.height;
+    if((int64_t)target.width*outH>(int64_t)target.height*outW)cropW=max(1,target.height*outW/outH);
+    else cropH=max(1,target.width*outH/outW);
+    int ox=(target.width-cropW)/2,oy=(target.height-cropH)/2;
+    for(int y=0;y<outH;y++){
+      int y0=oy+y*cropH/outH,y1=max(y0+1,min(target.height,oy+(y+1)*cropH/outH));
+      for(int x=0;x<outW;x++){
+        int x0=ox+x*cropW/outW,x1=max(x0+1,min(target.width,ox+(x+1)*cropW/outW));
+        uint32_t sr=0,sg=0,sb=0,cnt=0;
+        for(int sy=y0;sy<y1;sy++)for(int sx=x0;sx<x1;sx++){
+          uint16_t p=rgb[sy*target.width+sx];
+          sr+=(p>>11)&0x1F;sg+=(p>>5)&0x3F;sb+=p&0x1F;cnt++;
+        }
+        out[y*outW+x]=(uint16_t)(((sr/cnt)<<11)|((sg/cnt)<<5)|(sb/cnt));
+      }
+    }
+    ok=true;
+  } while(false);
+  jpeg->close();delete jpeg;
+  free(rgb);
+  return ok;
+}
+#endif

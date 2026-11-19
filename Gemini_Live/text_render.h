@@ -71,8 +71,9 @@ class PanelText {
  public:
   U8G2_FOR_ADAFRUIT_GFX u8;
   uint8_t size=1; // GFX text size: 1 = 6x8 cells, 2 = 12x16 cells.
+  uint16_t fgColor=0;
 
-  void begin(Adafruit_GFX &gfx) { u8.begin(gfx);u8.setForegroundColor(0);u8.setFontMode(1);current=nullptr; }
+  void begin(Adafruit_GFX &gfx,uint16_t fg=0) { fgColor=fg;u8.begin(gfx);u8.setForegroundColor(fgColor);u8.setFontMode(1);current=nullptr; }
   void setSize(uint8_t s) { size=s; }
 
   // Where a code point is drawn from; `gfx` receives the CP437 bytes for GS_GFX.
@@ -99,7 +100,7 @@ class PanelText {
     if(s==GS_NONE)return 0;
     if(s==GS_GFX){
       int top=baseline-7*size;
-      for(const char *p=gfx;*p;p++,x+=6*size)u8.u8g2.gfx->drawChar(x,top,(uint8_t)*p,0,0,size);
+      for(const char *p=gfx;*p;p++,x+=6*size)u8.u8g2.gfx->drawChar(x,top,(uint8_t)*p,fgColor,fgColor,size);
       return strlen(gfx)*6*size;
     }
     use(s==GS_DEVA?devaFont():wideFont());

@@ -178,10 +178,17 @@ void finishPlayback() {
 String routerInstruction() {
   String voice=activeVoiceName.length()?activeVoiceName:String("the default voice (Kore)");
   return String(
+#if defined(BOARD_M5STICKS3)
+    "You route dictated requests on a tiny voice device with a 135x240 full-color portrait screen and a speaker. "
+    "The user text is a speech transcript. Choose exactly one action:\n"
+    "- image: the user wants a picture, drawing, illustration, poster or to see something. prompt = a vivid image prompt for a colorful, "
+    "high-impact vertical illustration with a clean, centered subject and bold lighting.\n"
+#else
     "You route dictated requests on a tiny voice device with a 200x200 black-and-white e-paper screen and a speaker. "
     "The user text is a speech transcript. Choose exactly one action:\n"
     "- image: the user wants a picture, drawing, illustration, poster or to see something. prompt = a vivid image prompt for a bold, "
     "high-contrast black-and-white illustration with a simple, centered composition, thick lines and minimal fine detail.\n"
+#endif
     "- song: the user wants music, a song, melody, jingle or tune. prompt = a music prompt keeping the requested genre, mood, "
     "instruments, language and any lyrics the user dictated.\n"
     "- voice: the user wants to create, design or change to a new voice persona. prompt = the user's own voice description, "
@@ -238,15 +245,19 @@ bool routePrompt(const String &prompt,Route &route) {
 void genFail(const String &message) {appState=APP_READY;status(message);}
 void genCancelled() {clearAudio();setCodecRate(16000);appState=APP_READY;status("Cancelled");}
 void failOrCancel(const char *message) {if(genCancel)genCancelled();else genFail(message);}
-void showBusy(const char *caption,const String &detail) {showScreen(MODE_BUSY,caption,detail,"BOOT: cancel",false);}
-const char *RESULT_FOOTER="BOOT: new | Side: again";
+void showBusy(const char *caption,const String &detail) {showScreen(MODE_BUSY,caption,detail,MAIN_BTN_NAME ": cancel",false);}
+const char *RESULT_FOOTER=MAIN_BTN_NAME ": new | " SIDE_BTN_NAME ": again";
 
 void doImage(const Route &route) {
   showBusy("Drawing image...",route.prompt);
   JsonDocument req;
   req["model"]=IMAGE_MODEL;req["input"]=route.prompt;
   auto format=req["response_format"];
+#if defined(BOARD_M5STICKS3)
+  format["type"]="image";format["mime_type"]="image/jpeg";format["aspect_ratio"]="9:16";format["image_size"]=IMAGE_SIZE_OPT;
+#else
   format["type"]="image";format["mime_type"]="image/jpeg";format["aspect_ratio"]="1:1";format["image_size"]=IMAGE_SIZE_OPT;
+#endif
   PsBuffer jpg;bool bad=false,complete=false;String mime;
   uint32_t started=millis();
   int code=interactionStream(req,[&](JsonVariant d,PsBuffer &bytes)->bool{
@@ -264,11 +275,21 @@ void doImage(const Route &route) {
   if(code!=200&&!jpg.len){genFail("Image failed. Try again");return;}
   if(bad||!jpg.len){genFail("No image returned");return;}
   Serial.printf("IMAGE: mime=%s %u bytes magic=%02x%02x request=%ums\n",mime.c_str(),(unsigned)jpg.len,jpg.data[0],jpg.data[1],(unsigned)(millis()-started));
-  static uint8_t decoded[IMAGE_BYTES];
   uint32_t decodeStart=millis();
+#if defined(BOARD_M5STICKS3)
+  uint16_t *decoded=(uint16_t*)ps_malloc((size_t)SCREEN_W*SCREEN_H*sizeof(uint16_t));
+  if(!decoded||!imageRgb565||!jpegToRgb565(jpg.data,jpg.len,decoded,SCREEN_W,SCREEN_H)){free(decoded);genFail("Image decode failed");return;}
+  Serial.printf("IMAGE: decode+scale=%ums\n",(unsigned)(millis()-decodeStart));
+  xSemaphoreTake(screenLock,portMAX_DELAY);
+  memcpy(imageRgb565,decoded,(size_t)SCREEN_W*SCREEN_H*sizeof(uint16_t));
+  xSemaphoreGive(screenLock);
+  free(decoded);
+#else
+  static uint8_t decoded[IMAGE_BYTES];
   if(!jpegToBitmap(jpg.data,jpg.len,decoded)){genFail("Image decode failed");return;}
   Serial.printf("IMAGE: decode+dither=%ums\n",(unsigned)(millis()-decodeStart));
   memcpy(imageBitmap,decoded,IMAGE_BYTES);
+#endif
   appState=APP_RESULT;
   showScreen(MODE_IMAGE,"",route.prompt,"",false);
 }
@@ -295,7 +316,7 @@ void doSpeech(const String &text,const String &style) {
     Serial.printf("PLAYBACK: start (%s) buffered=%.1fs est=%.1fs speed=%.2fx wait=%ums\n",
                   why,(float)samples/rate,estSeconds,speed,(unsigned)(millis()-firstAudio));
     appState=APP_PLAYING;
-    showScreen(MODE_PANEL,"SPEECH",text,"BOOT: stop",true);
+    showScreen(MODE_PANEL,"SPEECH",text,MAIN_BTN_NAME ": stop",true);
   };
   int code=interactionStream(req,[&](JsonVariant d,PsBuffer &chunk)->bool{
     if(d["type"]!="audio")return !genCancel;
@@ -353,7 +374,7 @@ void doSong(const Route &route) {
   lyrics.trim();
   if(lyrics.isEmpty())lyrics=route.prompt;
   appState=APP_PLAYING;
-  showScreen(MODE_PANEL,"SONG",lyrics,"BOOT: stop",true);
+  showScreen(MODE_PANEL,"SONG",lyrics,MAIN_BTN_NAME ": stop",true);
   bool ok=mime.indexOf("wav")>=0||mime.indexOf("l16")>=0?playAudioPart(audio,mime.c_str()):playMp3(audio);
   audio.release();
   if(!ok){setCodecRate(16000);genFail("Song playback failed");return;}
@@ -421,7 +442,7 @@ void doVoiceDesign(const Route &route) {
   String panel=name+"\n\n"+route.prompt;
   if(sample.len&&!genCancel){
     appState=APP_PLAYING;
-    showScreen(MODE_PANEL,"NEW VOICE",panel,"BOOT: stop",true);
+    showScreen(MODE_PANEL,"NEW VOICE",panel,MAIN_BTN_NAME ": stop",true);
     playAudioPart(sample,mime.c_str());
     finishPlayback();
   }
