@@ -47,9 +47,14 @@ bool bootSetupHandled=false,bootLongStopped=false;
 String ssid, password, apiKey, serialLine, fragments;
 #if defined(BOARD_M5STICKS3)
 volatile bool wantMicMode=false;
-constexpr uint8_t STICK_SPEAKER_VOL=240; // 0..255 (M5.Speaker applies quadratic scaling).
-constexpr uint8_t STICK_SPK_MAG=12;      // Midpoint gain: ~3.3x louder than mag=4, clean below 0 dBFS.
+constexpr uint8_t STICK_SPEAKER_VOL=225; // 0..255 (M5.Speaker applies quadratic scaling).
+constexpr uint8_t STICK_SPK_MAG=6;       // Louder than mag=4, stays under AW8737 brownout threshold.
 constexpr uint8_t STICK_DAC_VOL=0xBF;    // ES8311 reg 0x32: 0xBF = 0 dB (no digital clipping).
+constexpr uint8_t STICK_BRIGHTNESS=140;  // Crisp IPS brightness while leaving headroom for charging/speaker.
+constexpr uint8_t STICK_DIM_BRIGHTNESS=30;
+constexpr uint32_t STICK_DIM_MS=15000;
+constexpr uint32_t STICK_BAT_SLEEP_MS=45000;
+bool stickDimmed=false,stickModemSleep=false;
 uint16_t *imageRgb565=nullptr;
 #else
 esp_codec_dev_handle_t mic, speaker;
@@ -116,9 +121,11 @@ void sampleBattery(){
 #if defined(BOARD_M5STICKS3)
   int lvl=M5.Power.getBatteryLevel();
   int mv=M5.Power.getBatteryVoltage();
+  int vbus=M5.Power.getVBUSVoltage();
+  bool chg=M5.Power.isCharging()==m5::Power_Class::is_charging;
   batteryVoltage=mv>0?mv/1000.0f:0.0f;
   batteryPercent=(lvl>=0&&lvl<=100)?lvl:-1;
-  Serial.printf("GEMINI_BATTERY: voltage=%.3f estimate=%d%%\n",batteryVoltage,batteryPercent);
+  Serial.printf("GEMINI_BATTERY: voltage=%.3f estimate=%d%% charging=%d vbus=%dmV\n",batteryVoltage,batteryPercent,chg,vbus);
 #else
   // Waveshare's ADC example: ADC1 channel 3 (GPIO4), 2:1 divider.
   uint32_t total=0;for(int i=0;i<16;i++)total+=analogReadMilliVolts(4);
@@ -364,7 +371,7 @@ void screenTask(void*) {
     bool poweredOff=strcmp(text,"Powered off")==0;
     bool sleeping=poweredOff||strcmp(text,"Light sleep")==0;
     if(panelAsleep&&!sleeping){
-      M5.Display.wakeup();M5.Display.setBrightness(200);panelAsleep=false;
+      M5.Display.wakeup();M5.Display.setBrightness(STICK_BRIGHTNESS);panelAsleep=false;
     }
     if(!canvas)continue;
     if(msg.mode==MODE_IMAGE){
@@ -649,8 +656,10 @@ void screenTask(void*) {
 // audioTask owns M5.Mic and M5.Speaker lifecycle and switches cleanly between them.
 void stickSpeakerBegin() {
   M5.Speaker.begin();
-  M5.Speaker.setVolume(STICK_SPEAKER_VOL);
-  M5.Speaker.setChannelVolume(0,255); // Speech / music at full volume.
+  // AW8737 draws peak bursts from the battery rail even on USB; scale down when VBAT < 3.70 V.
+  uint8_t vol=(batteryVoltage>0.0f&&batteryVoltage<3.70f)?185:STICK_SPEAKER_VOL;
+  M5.Speaker.setVolume(vol);
+  M5.Speaker.setChannelVolume(0,255); // Speech / music at full channel volume.
   M5.Speaker.setChannelVolume(1,96);  // Keep button beeps moderate.
   M5.In_I2C.writeRegister8(0x18,0x32,STICK_DAC_VOL,100000);
 }
@@ -658,6 +667,7 @@ void audioTask(void*) {
   static MicFrame recBuf[2];
   static int16_t playBuf[3][512];
   int playIdx=0;
+  int32_t hpPrevX=0,hpY=0;
   bool inMicMode=false;
   stickSpeakerBegin();
   for(;;) {
@@ -712,7 +722,14 @@ void audioTask(void*) {
       if(M5.Speaker.isPlaying(0)<2){
         xSemaphoreTake(audioMutex,portMAX_DELAY);
         size_t got=min((size_t)512,(size_t)audioUsed);
-        for(size_t i=0;i<got;i++){playBuf[playIdx][i]=audioRing[readPos];if(++readPos==RING_SAMPLES)readPos=0;}
+        for(size_t i=0;i<got;i++){
+          // High-pass filter (~180 Hz) strips inaudible bass that wastes AW8737 charge-pump current.
+          int32_t s=audioRing[readPos];
+          hpY=s-hpPrevX+((hpY*244)>>8);
+          hpPrevX=s;
+          playBuf[playIdx][i]=(int16_t)constrain(hpY,-22000,22000);
+          if(++readPos==RING_SAMPLES)readPos=0;
+        }
         audioUsed-=got;
         xSemaphoreGive(audioMutex);
         if(got){
@@ -986,8 +1003,12 @@ void connectWifi() {
   if(esp_sntp_enabled())esp_sntp_stop();
   netPrimed=false;
   WiFi.mode(WIFI_STA);
+#if defined(BOARD_M5STICKS3)
+  WiFi.setTxPower(WIFI_POWER_15dBm); // Reduce TX current spikes on the 250 mAh cell.
+  stickModemSleep=false;
+#endif
   // Modem sleep delays downlink packets to the next beacon; with the core's 5.7 KB TCP window
-  // that caps media downloads. Idle light sleep turns Wi-Fi off anyway.
+  // that caps media downloads. StickS3 enables modem sleep only while idle in loop().
   WiFi.setSleep(false);
   WiFi.begin((selectedHotspot?backupSsid:ssid).c_str(),(selectedHotspot?backupPassword:password).c_str());
   wifiAttempt=millis();status(selectedHotspot?"Connecting hotspot":"Connecting home Wi-Fi");
@@ -1087,9 +1108,16 @@ void setup() {
   auto cfg=M5.config();
   cfg.internal_spk=true;
   cfg.internal_mic=true;
+  cfg.internal_imu=false;
+  cfg.internal_rtc=false;
+  cfg.output_power=false;
+  cfg.led_brightness=0;
   M5.begin(cfg);
+  M5.Power.setBatteryCharge(true);
+  M5.Power.setExtOutput(false); // Keep 5V Grove/Hat/IR boost off to save battery.
+  M5.In_I2C.bitOff(0x6E,0x06,1<<4,100000); // Turn off M5PM1 LED_EN rail.
   M5.Display.setRotation(0);
-  M5.Display.setBrightness(200);
+  M5.Display.setBrightness(STICK_BRIGHTNESS);
   M5.Display.setSwapBytes(true);
   M5.Display.fillScreen(0x0842);
   M5.Speaker.end();
@@ -1209,6 +1237,9 @@ void enterIdleSleep() {
   if(!audioReady&&audioPaused){Serial.println("ERROR: restarting to recover audio");ESP.restart();}
   audioHold=false;
   while(digitalRead(MAIN_BUTTON_PIN)==LOW)delay(10);
+#if defined(BOARD_M5STICKS3)
+  stickDimmed=false;
+#endif
   lastButton=stableButton=HIGH;buttonChanged=millis();bootLongHandled=bootSetupHandled=false;wifiRestartPending=false;
   lastSide=stableSide=digitalRead(SIDE_BUTTON_PIN);sideChanged=millis();sideLongHandled=stableSide==LOW;
   lastActivity=millis();lastBatterySample=millis();
@@ -1248,13 +1279,19 @@ void powerOff() {
   status("Powered off");
   xSemaphoreTake(sleepScreenReady,pdMS_TO_TICKS(15000));
 #if defined(BOARD_M5STICKS3)
+  M5.Power.setBatteryCharge(true);
   if(audioReady)holdAudio();
   while(digitalRead(SIDE_BUTTON_PIN)==LOW)delay(10);
   delay(200);
-  M5.Power.powerOff();
-  delay(500);
-  // Still running (e.g. USB powered): fall back to deep sleep until BtnA or BtnB.
-  Serial.println("POWER_OFF: on USB, deep sleep until " SIDE_BTN_NAME);Serial.flush();
+  // If USB is connected, keep M5PM1 awake in ESP32 deep sleep so the battery keeps charging;
+  // M5PM1 full shutdown can cut charging depending on PMIC state.
+  if(!HWCDC::isPlugged()&&M5.Power.getVBUSVoltage()<4000){
+    M5.Power.powerOff();
+    delay(500);
+  }
+  // Cut L3B peripheral power rail (LCD/codec/PA) before deep sleep; M5GFX restores it on boot.
+  M5.In_I2C.bitOff(0x6E,0x11,1<<2,100000);
+  Serial.println("POWER_OFF: on USB, deep sleep (charging enabled) until " SIDE_BTN_NAME);Serial.flush();
   rtc_gpio_pullup_en((gpio_num_t)SIDE_BUTTON_PIN);rtc_gpio_pulldown_dis((gpio_num_t)SIDE_BUTTON_PIN);
   esp_sleep_enable_ext0_wakeup((gpio_num_t)SIDE_BUTTON_PIN,0);
   esp_deep_sleep_start();
@@ -1332,7 +1369,16 @@ void loop() {
     doc["realtimeInput"]["audio"]["data"]=encoded;sendJson(doc);
   }
   if(wanted||genBusy||wifiDiagnosticScan||!configured||WiFi.status()!=WL_CONNECTED)lastActivity=millis();
+#if defined(BOARD_M5STICKS3)
+  bool wantModemSleep=!setupMode&&!wanted&&!genBusy&&netPrimed&&WiFi.status()==WL_CONNECTED;
+  if(wantModemSleep!=stickModemSleep){stickModemSleep=wantModemSleep;WiFi.setSleep(wantModemSleep);}
+  bool shouldDim=!lastUsbConnected&&!wanted&&!genBusy&&millis()-lastActivity>=STICK_DIM_MS;
+  if(shouldDim!=stickDimmed){stickDimmed=shouldDim;M5.Display.setBrightness(shouldDim?STICK_DIM_BRIGHTNESS:STICK_BRIGHTNESS);}
+  uint32_t idleTimeout=lastUsbConnected?IDLE_SLEEP_MS:STICK_BAT_SLEEP_MS;
+#else
+  uint32_t idleTimeout=IDLE_SLEEP_MS;
+#endif
   if(!wanted&&!genBusy&&!wifiDiagnosticScan&&configured&&WiFi.status()==WL_CONNECTED&&
-     digitalRead(MAIN_BUTTON_PIN)==HIGH&&millis()-lastActivity>=IDLE_SLEEP_MS)enterIdleSleep();
+     digitalRead(MAIN_BUTTON_PIN)==HIGH&&millis()-lastActivity>=idleTimeout)enterIdleSleep();
   delay(1);
 }
